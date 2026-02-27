@@ -34,6 +34,7 @@ class ObservationManager:
         ("crate_quat",          4),   # crate orientation (world frame)
         ("goal_rel_pos",        3),   # goal pos relative to crate (command error)
         ("goal_abs_vel_error",  3),   # crate velocity in direction of goal (abs)
+        ("neighbour_rel_pos", (NUM_DRONES - 1) * 3),  # relative pos of other drones
     ]
 
     def __init__(self, env):
@@ -76,6 +77,7 @@ class ObservationManager:
             self._crate_quat(),          # (n, A, 4)
             self._goal_rel_pos(),        # (n, A, 3)
             self._goal_abs_vel_error(),  # (n, A, 3)
+            self._neighbour_rel_pos(),   # (n, A, (A-1)*3)
         ], dim=-1)  # (n, A, obs_dim)
 
         return {

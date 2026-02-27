@@ -3,3 +3,6 @@ __pycache__/
 src/__pycache__/
 Managers/__pycache__/
 src/DroneStuff/
+logs/
+src/logs/
+videos/

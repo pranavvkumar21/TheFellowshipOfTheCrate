@@ -18,30 +18,6 @@ from quadcopter_lift_env_cfg import (
 )
 
 
-# ---------------------------------------------------------------------------
-# GPU-compatible rope joint using D6 with a linear distance limit
-#
-# Why D6 and not DistanceJoint:
-#   PhysX GPU pipeline only supports D6 joints. DistanceJoint maps to a
-#   non-GPU PxConstraint and is rejected at scene init with the error:
-#   "use a D6 joint instead"
-#
-# Rope simulation with D6:
-#   - Lock all rotational DOFs  → bodies can't rotate relative to each other
-#     through the joint anchor (the joint is a pivot point, not a hinge)
-#   - Free all translational DOFs with a *distance* soft limit:
-#     we use the distanceLimit on the D6 joint, which constrains the
-#     Euclidean distance between the two anchor frames. When distance
-#     exceeds rope_max_distance the limit spring kicks in — this is the
-#     taut-rope effect.
-#
-# Joint path placement:
-#   MUST be outside both articulation prim trees. We place joints under
-#   /World/Joints/env_<e>/  which is a neutral namespace. Placing the
-#   joint prim anywhere under /World/envs/env_<e>/drone_<i>/  would make
-#   PhysX absorb it into the articulation and crash with:
-#   "Articulation cannot contain a distance joint"
-# ---------------------------------------------------------------------------
 
 def _create_rope_d6(
     stage,
@@ -54,23 +30,7 @@ def _create_rope_d6(
     rope_damping: float = 10.0,
     rope_stiffness: float = 1.0,
 ) -> None:
-    """
-    GPU-compatible rope using a D6 joint (UsdPhysics.Joint):
-      - All 3 translational axes FREE (bodies can move apart freely)
-      - All 3 rotational axes LIMITED to a small cone via LimitAPI
-        (prevents torque transfer while still allowing angular play)
-      - DriveAPI adds damping on rotY/rotZ so the rope doesn't oscillate
-        forever — this is the correct approach per Isaac Sim docs [web:69]
-
-    There is no PhysxD6JointAPI or PhysxSchema linear distance limit.
-    The "rope length" is enforced by the attachment point geometry:
-    drones start at max_dist above the crate, so the joint is already
-    taut at rest. Free translation means PhysX won't push them apart,
-    and the drone thrust/gravity balance keeps tension on the rope.
-
-    For a hard max-distance cap, set rotational limits very tight
-    and use the attachment offset positions to control effective rope length.
-    """
+    
     # --- Base D6 joint (UsdPhysics.Joint = D6 in PhysX) ---
     joint      = UsdPhysics.Joint.Define(stage, joint_path)
     joint_prim = joint.GetPrim()
@@ -89,29 +49,11 @@ def _create_rope_d6(
     joint.CreateJointEnabledAttr().Set(True)
     joint.CreateCollisionEnabledAttr().Set(False)
 
-    # --- Free all translational DOFs (rope can go slack or taut) ---
-    # Setting low > high disables the limit entirely for that axis
-    # for axis in ["transX", "transY", "transZ"]:
-    #     limit = UsdPhysics.LimitAPI.Apply(joint_prim, axis)
-    #     limit.CreateLowAttr().Set(-max_dist)    # low > high = limit disabled = FREE
-    #     limit.CreateHighAttr().Set(max_dist)
-    
-    # Distance constraint: ONLY max distance (PhysX GPU doesn't support min on D6)
-    # Gravity + drone thrust will naturally keep the rope taut at the correct length
+
     dist_limit = UsdPhysics.LimitAPI.Apply(joint_prim, UsdPhysics.Tokens.distance)
     dist_limit.CreateLowAttr().Set(0.0)  # Must be 0, not max_dist - PhysX requirement
     dist_limit.CreateHighAttr().Set(max_dist)
-    
-    # Add drive to distance to disable any implicit spring behavior
-    # dist_drive = UsdPhysics.DriveAPI.Apply(joint_prim, UsdPhysics.Tokens.distance)
-    # dist_drive.CreateTypeAttr().Set("force")
-    # dist_drive.CreateStiffnessAttr().Set(0.0)  # No spring force pulling them together
-    # dist_drive.CreateDampingAttr().Set(0.0)    # No damping
-    # dist_drive.CreateTargetPositionAttr().Set(0.0)  # No target position
-    
-    # --- Limit rotational DOFs to a small cone (±45°) ---
-    # Prevents full torque transfer while allowing the rope to hang naturally.
-    # Tighten cone_limit toward 0 for a stiffer attachment point.
+
     cone_limit = 45.0   # degrees
     for axis in ["rotX", "rotY", "rotZ"]:
         limit = UsdPhysics.LimitAPI.Apply(joint_prim, axis)
