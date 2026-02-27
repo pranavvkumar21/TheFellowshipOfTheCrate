@@ -91,24 +91,23 @@ def _create_rope_d6(
 
     # --- Free all translational DOFs (rope can go slack or taut) ---
     # Setting low > high disables the limit entirely for that axis
-    for axis in ["transX", "transY", "transZ"]:
-        limit = UsdPhysics.LimitAPI.Apply(joint_prim, axis)
-        limit.CreateLowAttr().Set(1.0)    # low > high = limit disabled = FREE
-        limit.CreateHighAttr().Set(-1.0)
+    # for axis in ["transX", "transY", "transZ"]:
+    #     limit = UsdPhysics.LimitAPI.Apply(joint_prim, axis)
+    #     limit.CreateLowAttr().Set(-max_dist)    # low > high = limit disabled = FREE
+    #     limit.CreateHighAttr().Set(max_dist)
     
-    # Tight rope length constraint (±5cm tolerance)
-    tolerance = 0.05
-    min_dist = max(0.0, max_dist - tolerance)
-    
+    # Distance constraint: ONLY max distance (PhysX GPU doesn't support min on D6)
+    # Gravity + drone thrust will naturally keep the rope taut at the correct length
     dist_limit = UsdPhysics.LimitAPI.Apply(joint_prim, UsdPhysics.Tokens.distance)
-    dist_limit.CreateLowAttr().Set(min_dist)
-    dist_limit.CreateHighAttr().Set(max_dist + tolerance)
+    dist_limit.CreateLowAttr().Set(0.0)  # Must be 0, not max_dist - PhysX requirement
+    dist_limit.CreateHighAttr().Set(max_dist)
     
-    # CRITICAL: Disable spring that pulls crate toward drones
-    physx_joint = PhysxSchema.PhysxPhysicsDistanceJointAPI.Apply(joint_prim)
-    physx_joint.CreateSpringEnabledAttr().Set(False)
-    physx_joint.CreateSpringStiffnessAttr().Set(0.0)
-    physx_joint.CreateSpringDampingAttr().Set(0.0)
+    # Add drive to distance to disable any implicit spring behavior
+    # dist_drive = UsdPhysics.DriveAPI.Apply(joint_prim, UsdPhysics.Tokens.distance)
+    # dist_drive.CreateTypeAttr().Set("force")
+    # dist_drive.CreateStiffnessAttr().Set(0.0)  # No spring force pulling them together
+    # dist_drive.CreateDampingAttr().Set(0.0)    # No damping
+    # dist_drive.CreateTargetPositionAttr().Set(0.0)  # No target position
     
     # --- Limit rotational DOFs to a small cone (±45°) ---
     # Prevents full torque transfer while allowing the rope to hang naturally.
@@ -437,6 +436,10 @@ class CoopLiftEnv(DirectMARLEnv):
         crate_state[:, 2] = self.cfg.crate.init_state.pos[2]  # Fixed z = 0.1
         crate_state[:, :3] += self.scene.env_origins[env_ids]
         self._crate.write_root_state_to_sim(crate_state, env_ids)
+        
+        if 0 in env_ids:
+            print(f"\n[DEBUG RESET] Crate position AFTER reset: {crate_state[0, :3]}")
+            print(f"  Crate Z should be: {self.cfg.crate.init_state.pos[2]} + env_origin_z")
 
         # ------------------------------------------------------------------
         # Reset each drone to its spawn corner — fully vectorised
@@ -481,6 +484,15 @@ class CoopLiftEnv(DirectMARLEnv):
 
             drone.write_root_pose_to_sim(state[:, :7], env_ids=env_ids)
             drone.write_root_velocity_to_sim(state[:, 7:], env_ids=env_ids)
+            
+            if 0 in env_ids and i == 0:
+                idx = (env_ids == 0).nonzero(as_tuple=True)[0][0]
+                print(f"[DEBUG RESET] Drone_0 position AFTER reset: {state[idx, :3]}")
+                print(f"  Expected Z: {self.cfg.crate.init_state.pos[2]} + {self.cfg.crate_size[2]/2} + {self.cfg.rope_length} + 0.02 = {spawn_z[idx]}")
+                crate_attach_z = self.cfg.crate.init_state.pos[2] + self.cfg.crate_size[2]/2
+                drone_attach_z = state[idx, 2] - 0.02
+                rope_dist = drone_attach_z - crate_attach_z
+                print(f"  Rope attachment distance: {rope_dist:.3f}m (should be {self.cfg.rope_length}m)\n")
 
         # ------------------------------------------------------------------
         # Clear buffers

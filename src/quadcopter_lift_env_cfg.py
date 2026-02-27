@@ -111,7 +111,7 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
     max_crate_tilt:         float = 0.524
 
     # ── Set rope_length here. Everything else is derived in __post_init__ ──
-    rope_length: float = 12.0
+    rope_length: float = 0.5
     rope_length_tolerance: float = 0.05  # ±5cm around rope_length
     reset_grace_steps: int = 120  # ~2s at 60Hz control (no termination after reset)
 
@@ -151,7 +151,9 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
             (-half_xy, -half_xy, half_z),
             ( half_xy, -half_xy, half_z),
         ]
-        self.rope_max_distance = self.rope_length + self.rope_length_tolerance
+        # PhysX only supports max distance on D6 joints, not min
+        # So rope_max_distance is the hard limit the rope can't exceed
+        self.rope_max_distance = self.rope_length
 
         # ── Rebuild ArticulationCfgs with correct spawn heights ───────────
         self.drone_0 = _make_drone_cfg(self.DRONE_INIT_POSITIONS[0], 0)

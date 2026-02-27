@@ -147,7 +147,7 @@ def main():
         t0 = time.perf_counter()
 
         # Random policy
-        actions = sample_random_actions(env, device)
+        actions = sample_lift_actions(env, device)
 
         # Step the environment
         obs_dict, reward_dict, terminated_dict, time_outs_dict, info = env.step(actions)
@@ -156,7 +156,13 @@ def main():
 
         # Accumulate rewards
         for name in cfg.possible_agents:
-            total_rewards[name] += reward_dict[name].mean().item()
+            crate_pos = env._crate.data.root_pos_w  # Debug: print crate and drone positions for first 10 steps
+        if step < 10:
+            crate_pos = env._crate.data.root_pos_w[:, :3]
+            drone_pos = env._drones['drone_0'].data.root_pos_w[:, :3]
+            # Only print env 0
+            rope_attach_dist = drone_pos[0, 2] - 0.02 - (crate_pos[0, 2] + env.cfg.crate_size[2]/2)
+            print(f"[DEBUG STEP {step}] Crate Z: {crate_pos[0, 2]:.3f}  Drone_0 Z: {drone_pos[0, 2]:.3f}  Rope dist: {rope_attach_dist:.3f}")
 
         # Periodic console output
         print_reward_stats(step, reward_dict, interval=100)
