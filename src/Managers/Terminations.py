@@ -153,14 +153,19 @@ class TerminationManager:
     def _drone_ground_collision(self) -> torch.Tensor:
         """
         True if any drone goes below min_drone_height or above max_drone_height.
+        Respects grace period after reset.
         """
+        # Grace period: don't terminate during first ~2 seconds after reset
+        grace_period = self.env.episode_length_buf < self.env.cfg.reset_grace_steps
+        
         pos = self._all_drone_pos()    # (n, A, 3)
         z   = pos[:, :, 2]            # (n, A)
 
         too_low  = (z < self.min_drone_height).any(dim=-1)   # (n,)
         too_high = (z > self.max_drone_height).any(dim=-1)   # (n,)
 
-        return too_low | too_high                             # (n,)
+        # Only apply after grace period
+        return (too_low | too_high) & (~grace_period)   # (n,)
 
     def _crate_tip_over(self) -> torch.Tensor:
         """

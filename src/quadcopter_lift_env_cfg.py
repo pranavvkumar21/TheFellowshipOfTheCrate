@@ -111,7 +111,9 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
     max_crate_tilt:         float = 0.524
 
     # ── Set rope_length here. Everything else is derived in __post_init__ ──
-    rope_length: float = 6.0
+    rope_length: float = 12.0
+    rope_length_tolerance: float = 0.05  # ±5cm around rope_length
+    reset_grace_steps: int = 120  # ~2s at 60Hz control (no termination after reset)
 
     # Placeholders — populated by __post_init__, do NOT set manually
     rope_max_distance:    float = 0.0
@@ -129,7 +131,12 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
         half_z  = self.crate.spawn.size[2] / 2          # 0.1
         half_xy = self.crate.spawn.size[0] / 2          # 0.2
 
-        drone_z = crate_centre_z + half_z + self.rope_length
+        # ── Account for rope attachment offsets when positioning drones ────
+        # Crate attachment is at +half_z from crate center (top face)
+        # Drone attachment is at -0.02 from drone center (2cm below)
+        # So drone must be higher by 0.02m to maintain rope_length distance
+        drone_attachment_offset = 0.02
+        drone_z = crate_centre_z + half_z + self.rope_length + drone_attachment_offset
 
         # ── Derived geometry ──────────────────────────────────────────────
         self.DRONE_INIT_POSITIONS = [
@@ -144,7 +151,7 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
             (-half_xy, -half_xy, half_z),
             ( half_xy, -half_xy, half_z),
         ]
-        self.rope_max_distance = self.rope_length * 1.1
+        self.rope_max_distance = self.rope_length + self.rope_length_tolerance
 
         # ── Rebuild ArticulationCfgs with correct spawn heights ───────────
         self.drone_0 = _make_drone_cfg(self.DRONE_INIT_POSITIONS[0], 0)

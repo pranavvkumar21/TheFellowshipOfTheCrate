@@ -96,14 +96,19 @@ def _create_rope_d6(
         limit.CreateLowAttr().Set(1.0)    # low > high = limit disabled = FREE
         limit.CreateHighAttr().Set(-1.0)
     
-    dist_limit = UsdPhysics.LimitAPI.Apply(joint_prim, UsdPhysics.Tokens.distance)
-    dist_limit.CreateLowAttr().Set(-1.0)       # ignored / disabled
-    dist_limit.CreateHighAttr().Set(max_dist)  # <-- THIS is your rope lengthv
+    # Tight rope length constraint (±5cm tolerance)
+    tolerance = 0.05
+    min_dist = max(0.0, max_dist - tolerance)
     
+    dist_limit = UsdPhysics.LimitAPI.Apply(joint_prim, UsdPhysics.Tokens.distance)
+    dist_limit.CreateLowAttr().Set(min_dist)
+    dist_limit.CreateHighAttr().Set(max_dist + tolerance)
+    
+    # CRITICAL: Disable spring that pulls crate toward drones
     physx_joint = PhysxSchema.PhysxPhysicsDistanceJointAPI.Apply(joint_prim)
     physx_joint.CreateSpringEnabledAttr().Set(False)
-    physx_joint.CreateSpringStiffnessAttr().Set(0* 100.0)  # tune as needed
-    physx_joint.CreateSpringDampingAttr().Set(rope_damping)
+    physx_joint.CreateSpringStiffnessAttr().Set(0.0)
+    physx_joint.CreateSpringDampingAttr().Set(0.0)
     
     # --- Limit rotational DOFs to a small cone (±45°) ---
     # Prevents full torque transfer while allowing the rope to hang naturally.
@@ -219,7 +224,7 @@ class CoopLiftEnv(DirectMARLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-        # --- Rope joints AFTER cloning, outside articulation trees ---
+        # --- Rope joints will be created on first reset when bodies exist ---
         self._joints_created = False
     # -----------------------------------------------------------------------
     def _print_prim_tree(self, root_path: str, max_depth: int = 4):
@@ -380,9 +385,7 @@ class CoopLiftEnv(DirectMARLEnv):
         return self._reward_manager.compute(terminated, timed_out) 
     # -----------------------------------------------------------------------
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        for i in range(NUM_DRONES):
-            drone_pos = self._drones[f"drone_{i}"].data.root_pos_w[:, 2]
-            print(f"[DEBUG] drone_{i} height sample = {drone_pos[0].item():.2f}")
+        # Termination manager already checks all conditions including height
         return self._termination_manager.compute() 
 
     # -----------------------------------------------------------------------
@@ -402,6 +405,8 @@ class CoopLiftEnv(DirectMARLEnv):
         #reset action manager state for these envs
         self._action_manager.reset(env_ids)
         self._reward_manager.reset(env_ids)
+
+        # Create joints ONCE on first reset (after super() initializes physics bodies)
         if not self._joints_created:
             self._create_rope_joints()
             self._joints_created = True
@@ -425,9 +430,11 @@ class CoopLiftEnv(DirectMARLEnv):
         self._crate_mass[env_ids] = new_masses.to(self.device)
 
         # ------------------------------------------------------------------
-        # Reset crate pose — fixed geometry so z is always cfg half-height
+        # Reset crate pose — fixed geometry, explicit position
         # ------------------------------------------------------------------
         crate_state = self._crate.data.default_root_state[env_ids].clone()
+        crate_state[:, 0:3] = 0.0  # Reset to origin in local frame
+        crate_state[:, 2] = self.cfg.crate.init_state.pos[2]  # Fixed z = 0.1
         crate_state[:, :3] += self.scene.env_origins[env_ids]
         self._crate.write_root_state_to_sim(crate_state, env_ids)
 
@@ -457,20 +464,20 @@ class CoopLiftEnv(DirectMARLEnv):
             sy = corner_signs[i, 1] * half[:, 1]   # (n,)
             sz = half[:, 2]                         # (n,)
 
-            spawn_z = crate_z + sz + self.cfg.rope_length  # (n,)
+            # Account for drone attachment offset (rope attaches 2cm below drone center)
+            drone_attachment_offset = 0.02
+            spawn_z = crate_z + sz + self.cfg.rope_length + drone_attachment_offset  # (n,)
 
             state = drone.data.default_root_state[env_ids].clone()  # (n, 13)
 
-            # ── Local env frame only — do NOT add env_origins ──
+            # Set position in local frame, then add env origins
             state[:, 0] = sx
             state[:, 1] = sy
             state[:, 2] = spawn_z
-
-            print(f"[DEBUG] rope_length = {self.cfg.rope_length}")
-            print(f"[DEBUG] crate_z = {crate_z}, sz sample = {sz[0].item()}")
-            print(f"[DEBUG] spawn_z sample = {spawn_z[0].item()}")
-            print(f"[DEBUG] state[:3] sample = {state[0, :3]}")
-
+            state[:, :3] += self.scene.env_origins[env_ids]
+            
+            # Clear velocities
+            state[:, 7:] = 0.0
 
             drone.write_root_pose_to_sim(state[:, :7], env_ids=env_ids)
             drone.write_root_velocity_to_sim(state[:, 7:], env_ids=env_ids)
