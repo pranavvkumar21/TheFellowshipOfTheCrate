@@ -18,7 +18,7 @@ W_TWIST              = -0.6    # twist: penalise crate yaw rate
 
 # Drone behaviour
 W_ALIVE              =  0.5    # per-step survival bonus
-W_SMOOTH_ACTION      =  0.02   # small bonus for smooth action (positive)
+W_SMOOTH_ACTION      =  -0.02   # small penalty for large action changes
 W_PROXIMITY          = -0.05   # small penalty for drones getting close
 
 # Terminal
@@ -54,7 +54,7 @@ class RewardManager:
     def __init__(self, env):
         self.env    = env
         self.device = env.device
-
+        self.dt = env.physics_dt
         # Precompute pair indices for proximity (same as termination manager)
         pairs = [(i, j) for i in range(NUM_DRONES) for j in range(i + 1, NUM_DRONES)]
         self._pair_idx = torch.tensor(pairs, device=self.device)   # (6, 2)
@@ -85,25 +85,48 @@ class RewardManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def reset(self, env_ids: torch.Tensor) -> None:
+    def reset(self, env_ids: torch.Tensor) -> dict[str, float]:
+        """Reset internal buffers and return the average episode rewards for the resetting envs."""
         self._prev_action_state[env_ids] = 0.0
-        for k in self._episode_sums:
-            self._episode_sums[k][env_ids] = 0.0
+        
+        # Prepare a dictionary to hold the final logged values for these environments
+        logged_rewards = {}
+        
+        if len(env_ids) > 0:
+            for key, val_tensor in self._episode_sums.items():
+                # Average the accumulated reward across the resetting environments
+                avg_sum = torch.mean(val_tensor[env_ids]).item()
+                
+                # Normalize by episode length (optional, but standard in IsaacLab)
+                avg_reward_per_step = avg_sum / self.env.max_episode_length
+                
+                # Format key with 'rew_' prefix for RSL-RL
+                logged_rewards[f"rew_{key}"] = avg_reward_per_step
+                
+                # Clear the buffer
+                self._episode_sums[key][env_ids] = 0.0
+                
+        return logged_rewards
 
     def compute(self, terminated: torch.Tensor, timed_out: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Returns shared reward broadcast to all agents.
         {"drone_i": (num_envs,)}
         """
-        components = {
+        dt = self.env.step_dt
+
+        # 1. Compute raw, UNSCALED components for logging
+        raw_components = {
             "goal_height"    : W_GOAL_HEIGHT     * self._rew_goal_height(),
             "goal_dist"      : W_GOAL_DIST       * self._rew_goal_dist(),
             "goal_vel_align" : W_GOAL_VEL_ALIGN  * self._rew_goal_vel_align(),
             "balance"        : W_BALANCE         * self._rew_balance(),
             "twist"          : W_TWIST           * self._rew_twist(),
-            "alive"          : W_ALIVE           * self._rew_alive(),
+            # "alive"          : W_ALIVE           * self._rew_alive(),
             "smooth_action"  : W_SMOOTH_ACTION   * self._rew_smooth_action(),
             "proximity"      : W_PROXIMITY       * self._rew_proximity(),
+            
+            # Terminal rewards (always unscaled)
             "success"        : W_SUCCESS         * terminated.float() *
                                (self.env._crate.data.root_pos_w[:, 2] >=
                                 self.env.cfg.goal_pos[2] - 0.1).float(),
@@ -112,13 +135,27 @@ class RewardManager:
                                 self.env.cfg.goal_pos[2] - 0.1).float(),
         }
 
-        # Accumulate for logging
-        for k, v in components.items():
+        # 2. Accumulate the raw values for TensorBoard logging
+        for k, v in raw_components.items():
             self._episode_sums[k] += v
 
-        total = sum(components.values())   # (n,)
+        # 3. Apply dt scaling ONLY for the RL algorithm's training signal
+        continuous_keys = [
+            "goal_height", "goal_dist", "goal_vel_align", 
+            "balance", "twist", "smooth_action", "proximity"
+            # add "alive" here if you uncomment it
+        ]
+        
+        total_reward = torch.zeros(self.env.num_envs, device=self.device)
+        
+        for k, v in raw_components.items():
+            if k in continuous_keys:
+                total_reward += v * dt   # Scale continuous rewards
+            else:
+                total_reward += v        # Add terminal events as-is (success, crash)
 
-        return {name: total for name in self.env.cfg.possible_agents}
+        return {name: total_reward for name in self.env.cfg.possible_agents}
+
 
     def get_episode_sums(self) -> dict[str, torch.Tensor]:
         return {k: v.clone() for k, v in self._episode_sums.items()}
@@ -129,24 +166,51 @@ class RewardManager:
 
     def _rew_goal_height(self) -> torch.Tensor:
         """
-        Exponential reward for crate reaching target height.
-        r = exp(-(z_goal - z_crate)² / sigma)
-        Peaks at 1.0 when crate is exactly at goal height.
+        Adapted from paper: r = W * exp(-3 * c_z * (z_curr - z_target)²)
+        where c_z is mapped as 1 / (initial_z_err²), turning the equation
+        into a scale-invariant percentage-based tracking reward.
         """
-        z_crate  = self.env._crate.data.root_pos_w[:, 2]          # (n,)
-        z_goal   = self.env._goal_pos_w[:, 2]                      # (n,)
-        z_err    = z_goal - z_crate                                # (n,)
-        return torch.exp(-(z_err ** 2) / GOAL_HEIGHT_SIGMA)        # (n,)  ∈ (0, 1]
+        z_crate  = self.env._crate.data.root_pos_w[:, 2]            # (n,)
+        z_goal   = self.env._goal_pos_w[:, 2]                        # (n,)
+        
+        # Current squared error
+        z_err_sq = (z_goal - z_crate) ** 2                           # (n,)
+        
+        # Determine the initial reference gap to normalize against.
+        # Assuming crate starts at its default Z position from config
+        z_start = self.env.cfg.crate.init_state.pos[2]
+        
+        # c_z = 1 / (initial_gap^2)
+        # Add 1e-5 to prevent division by zero if target equals start height
+        initial_gap_sq = (z_goal - z_start) ** 2
+        c_z = 1.0 / (initial_gap_sq + 1e-5)                          # (n,)
+        
+        return torch.exp(-3.0 * c_z * z_err_sq)                      # (n,)
+
 
     def _rew_goal_dist(self) -> torch.Tensor:
         """
-        Tanh-shaped 3D distance reward.
-        r = 1 - tanh(‖goal - crate‖ / 0.5)   ∈ (0, 1]
+        Paper's exponential tracking formula with adaptive c_dist.
+        c_dist = 1 / (initial_dist²) → scale-invariant percentage tracking.
         """
-        dist = torch.norm(
-            self.env._goal_pos_w - self.env._crate.data.root_pos_w, dim=-1
-        )   # (n,)
-        return 1.0 - torch.tanh(dist / 0.5)
+        goal_pos  = self.env._goal_pos_w                                # (n, 3)
+        crate_pos = self.env._crate.data.root_pos_w                     # (n, 3)
+        
+        # Current squared Euclidean distance
+        dist_sq_curr = torch.sum((goal_pos - crate_pos) ** 2, dim=-1)   # (n,)
+        
+        # Initial squared distance (crate start Z vs goal Z).
+        # This assumes you store the initial goal or crate start position.
+        # If you don't have the initial crate position cached, use:
+        # initial_z_crate = self.env.cfg.crate.init_state.pos[2]
+        initial_z_crate = 0.1  # or fetch from cached buffer
+        initial_dist_sq = torch.sum((goal_pos[:, 2] - initial_z_crate) ** 2)  # scalar
+        
+        # c_dist = 1 / (initial_dist²)
+        c_dist = 1.0 / (initial_dist_sq + 1e-8)                          # scalar
+        
+        return torch.exp(-3.0 * c_dist * dist_sq_curr)                    # (n,)
+ 
 
     def _rew_goal_vel_align(self) -> torch.Tensor:
         """
@@ -228,8 +292,7 @@ class RewardManager:
         mse     = delta.mean(dim=-1).mean(dim=-1)                   # (n,)
 
         self._prev_action_state = current.detach().clone()
-
-        return torch.exp(-mse / SMOOTH_ACTION_SIGMA)                # (n,)  ∈ (0, 1]
+        return mse
 
     def _rew_proximity(self) -> torch.Tensor:
         """
