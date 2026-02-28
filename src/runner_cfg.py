@@ -51,13 +51,13 @@ def create_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         # Learning rate — moderate; scheduler will anneal if desired
         learning_rate=3e-4,
         # Number of SGD epochs per rollout batch
-        num_learning_epochs=5,
+        num_learning_epochs=8,
         # Number of mini-batches per epoch
         # total_steps = num_envs * num_drones * num_steps_per_env
         # mini_batch_size = total_steps / num_mini_batches
         num_mini_batches=4,
         # Discount factor — 0.99 rewards long-horizon cooperative behaviour
-        gamma=0.99,
+        gamma=0.994,
         # GAE lambda
         lam=0.95,
         # Entropy coefficient — slightly elevated for sparse-ish lift task
@@ -69,7 +69,7 @@ def create_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         # Normalise advantages inside each mini-batch
         normalize_advantage_per_mini_batch=True,
         # Value function loss weight
-        value_loss_coef=1.0,
+        value_loss_coef=0.025,
         # Gradient clipping
         max_grad_norm=1.0,
     )
@@ -79,7 +79,7 @@ def create_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     # ------------------------------------------------------------------
     policy_cfg = RslRlPpoActorCriticCfg(
         # Initial action noise std — moderate; log-parameterised std adapts
-        init_noise_std=0.3,
+        init_noise_std=0.8,
         noise_std_type="log",
         # Running mean/std normalisation for both actor and critic inputs
         actor_obs_normalization=True,
@@ -101,7 +101,7 @@ def create_runner_cfg() -> RslRlOnPolicyRunnerCfg:
 
         # ---- sampling ----
         # Rollout horizon per environment per update
-        num_steps_per_env=64,
+        num_steps_per_env=256,
         # Total gradient updates — increase for a full training run
         max_iterations=5000,
 

@@ -79,12 +79,16 @@ class FlattenedMARLWrapper(DirectRLEnv):
             low=-inf, high=inf, dtype=np.float32
         )
 
+
+        observation_spaces = {"policy": self.observation_space}
+
         # cfg shim — RslRlVecEnvWrapper reads:
         #   cfg.is_finite_horizon  (step: controls time_outs key)
         #   cfg.num_actions        (some runner versions)
         self.cfg = type("_Cfg", (), {
             "is_finite_horizon": True,   # coop-lift episodes have a hard timeout
             "num_actions":       self.action_dim,
+            "observation_spaces": observation_spaces,
         })()
 
         # episode_length_buf backing store — needs a setter (RSL-RL writes it)
