@@ -164,54 +164,19 @@ class RewardManager:
     # Reward terms — each returns (num_envs,)
     # ------------------------------------------------------------------
 
-    def _rew_goal_height(self) -> torch.Tensor:
-        """
-        Adapted from paper: r = W * exp(-3 * c_z * (z_curr - z_target)²)
-        where c_z is mapped as 1 / (initial_z_err²), turning the equation
-        into a scale-invariant percentage-based tracking reward.
-        """
-        z_crate  = self.env._crate.data.root_pos_w[:, 2]            # (n,)
-        z_goal   = self.env._goal_pos_w[:, 2]                        # (n,)
-        
-        # Current squared error
-        z_err_sq = (z_goal - z_crate) ** 2                           # (n,)
-        
-        # Determine the initial reference gap to normalize against.
-        # Assuming crate starts at its default Z position from config
-        z_start = self.env.cfg.crate.init_state.pos[2]
-        
-        # c_z = 1 / (initial_gap^2)
-        # Add 1e-5 to prevent division by zero if target equals start height
-        initial_gap_sq = (z_goal - z_start) ** 2
-        c_z = 1.0 / (initial_gap_sq + 1e-5)                          # (n,)
-        
-        return torch.exp(-3.0 * c_z * z_err_sq)                      # (n,)
-
-
-    def _rew_goal_dist(self) -> torch.Tensor:
-        """
-        Paper's exponential tracking formula with adaptive c_dist.
-        c_dist = 1 / (initial_dist²) → scale-invariant percentage tracking.
-        """
-        goal_pos  = self.env._goal_pos_w                                # (n, 3)
-        crate_pos = self.env._crate.data.root_pos_w                     # (n, 3)
-        
-        # Current squared Euclidean distance
-        dist_sq_curr = torch.sum((goal_pos - crate_pos) ** 2, dim=-1)   # (n,)
-        
-        # Initial squared distance (crate start Z vs goal Z).
-        # This assumes you store the initial goal or crate start position.
-        # If you don't have the initial crate position cached, use:
-        # initial_z_crate = self.env.cfg.crate.init_state.pos[2]
-        initial_z_crate = 0.1  # or fetch from cached buffer
-        initial_dist_sq = torch.sum((goal_pos[:, 2] - initial_z_crate) ** 2)  # scalar
-        
-        # c_dist = 1 / (initial_dist²)
-        c_dist = 1.0 / (initial_dist_sq + 1e-8)                          # scalar
-        
-        return torch.exp(-3.0 * c_dist * dist_sq_curr)                    # (n,)
- 
-
+    def _rew_goal_height(self):
+        z_crate  = self.env._crate.data.root_pos_w[:, 2]   # world Z
+        z_goal   = self.env._goal_pos_w[:, 2]               # world Z of sampled goal
+        height_error = (z_goal - z_crate).clamp(min=0.0)   # only penalise being below goal
+        return torch.exp(-2.0 * height_error)
+    
+    def _rew_goal_dist(self):
+        goal_pos  = self.env._goal_pos_w          # (n, 3) world frame, per-env
+        crate_pos = self.env._crate.data.root_pos_w[:, :3]  # (n, 3) world frame
+        dist_sq_curr    = torch.sum((goal_pos - crate_pos) ** 2, dim=-1)
+        # Use a fixed normalisation constant instead of initial dist (avoids div-by-zero edge cases)
+        reward = torch.exp(-3.0 * dist_sq_curr)
+        return reward
     def _rew_goal_vel_align(self) -> torch.Tensor:
         """
         Reward crate velocity that is aligned toward the goal.
@@ -248,10 +213,10 @@ class RewardManager:
         omega  = self.env._crate.data.root_ang_vel_w                # (n, 3)
         omega_xy_sq = (omega[:, 0] ** 2 + omega[:, 1] ** 2)        # (n,)  ||ω_xy||²
 
-        term1 = torch.exp(-2.5 * cx * (v_z ** 2))                  # (n,)
+        # term1 = torch.exp(-2.5 * cx * (v_z ** 2))                  # (n,)
         term2 = torch.exp(-2.0 * cx * omega_xy_sq)                 # (n,)
 
-        return term1 + term2                                        # (n,)  ∈ (0, 2]
+        return  term2                                        # (n,)  ∈ (0, 2]
 
     def _rew_twist(self) -> torch.Tensor:
         """
