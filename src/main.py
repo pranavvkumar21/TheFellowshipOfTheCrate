@@ -82,7 +82,7 @@ from wrapper                 import FlattenedMARLWrapper
 from runner_cfg              import create_runner_cfg
 from registration            import register_envs
 from utils.env_info          import print_env_info
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 
 
 # ===========================================================================

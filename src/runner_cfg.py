@@ -101,7 +101,7 @@ def create_runner_cfg() -> RslRlOnPolicyRunnerCfg:
 
         # ---- sampling ----
         # Rollout horizon per environment per update
-        num_steps_per_env=256,
+        num_steps_per_env=128,
         # Total gradient updates — increase for a full training run
         max_iterations=5000,
 

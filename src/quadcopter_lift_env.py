@@ -322,10 +322,9 @@ class CoopLiftEnv(DirectMARLEnv):
         return self._obs_manager.compute()
 
     # -----------------------------------------------------------------------
-    def _get_rewards(self) -> dict[str, torch.Tensor]:
-        terminated = self._termination_manager.compute()[0]["drone_0"]
-        timed_out  = self._termination_manager.compute()[1]["drone_0"]
-        return self._reward_manager.compute(terminated, timed_out) 
+    def _get_rewards(self):
+        term, timeout = self._termination_manager.compute()
+        return self._reward_manager.compute(term["drone_0"], timeout["drone_0"])
     # -----------------------------------------------------------------------
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         # Termination manager already checks all conditions including height
