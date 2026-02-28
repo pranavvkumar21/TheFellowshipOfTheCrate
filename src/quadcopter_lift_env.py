@@ -125,12 +125,10 @@ class CoopLiftEnv(DirectMARLEnv):
         self._action_manager = ActionManager(self)
         self._termination_manager = TerminationManager(self)
         self._reward_manager = RewardManager(self)
-        self._command_manager = CommandManager(self)
 
-        # Goal
-        self._goal_pos_w = torch.tensor(
-            self.cfg.goal_pos, device=self.device
-        ).unsqueeze(0).expand(self.num_envs, -1).clone()
+        # Goal set it to zero for now
+        self._goal_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._command_manager = None  # initialized on first reset when env origins are known
 
         # Episode accumulators
         self._episode_sums = {
@@ -343,7 +341,10 @@ class CoopLiftEnv(DirectMARLEnv):
         if env_ids is None:
             env_ids = self._drones["drone_0"]._ALL_INDICES
         super()._reset_idx(env_ids)
-
+        if self._command_manager is None:
+            self._command_manager = CommandManager(self)  # samples with real origins
+        else:
+            self._command_manager.reset(env_ids)
         #reset action manager state for these envs
         self._action_manager.reset(env_ids)
         reward_logs = self._reward_manager.reset(env_ids)
