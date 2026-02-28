@@ -12,7 +12,7 @@ GOAL_Z_MIN   =  1.2            # minimum lift height
 GOAL_Z_MAX   =  2.5            # maximum lift height
 
 # How close the crate must be to count as success (metres)
-GOAL_REACHED_THRESHOLD = 0.15
+GOAL_REACHED_THRESHOLD = 0.3
 
 
 class CommandManager:
