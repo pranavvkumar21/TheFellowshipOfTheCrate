@@ -35,6 +35,8 @@ class ObservationManager:
         ("goal_rel_pos",        3),   # goal pos relative to crate (command error)
         ("goal_abs_vel_error",  3),   # crate velocity in direction of goal (abs)
         ("neighbour_rel_pos", (NUM_DRONES - 1) * 3),  # relative pos of other drones
+        ("neighbour_linvel",   (NUM_DRONES - 1) * 3),  # absolute linvel of other drones
+        ("neighbour_quat",     (NUM_DRONES - 1) * 4),  # absolute orientation of other drones
     ]
 
     def __init__(self, env):
@@ -78,6 +80,8 @@ class ObservationManager:
             self._goal_rel_pos(),        # (n, A, 3)
             self._goal_abs_vel_error(),  # (n, A, 3)
             self._neighbour_rel_pos(),   # (n, A, (A-1)*3)
+            self._neighbour_linvel(),     # (n, A, (A-1)*3)
+            self._neighbour_quat(),       # (n, A, (A-1)*4)
         ], dim=-1)  # (n, A, obs_dim)
 
         return {
@@ -186,13 +190,46 @@ class ObservationManager:
         all_pos = self._all_drone_pos()   # (n, A, 3)
 
         # Build (n, A, A, 3): all pairwise differences
-        # all_pos[:, j] - all_pos[:, i]  for all i, j
         pairwise = all_pos.unsqueeze(2) - all_pos.unsqueeze(1)   # (n, A, A, 3)
 
         # Mask out self (diagonal) and flatten remaining A-1 neighbours
         A = NUM_DRONES
         mask = ~torch.eye(A, dtype=torch.bool, device=self.device)   # (A, A)
-        # Extract off-diagonal: (n, A, A-1, 3) → (n, A, (A-1)*3)
-        return pairwise[:, mask.unsqueeze(0).expand(pairwise.shape[0], -1, -1)] \
-             .view(pairwise.shape[0], A, (A - 1) * 3)
+        
+        # FIX: Apply the 2D mask directly to dims 1 and 2
+        return pairwise[:, mask].reshape(pairwise.shape[0], A, (A - 1) * 3)
+    def _neighbour_linvel(self) -> torch.Tensor:
+        """
+        Absolute linear velocity of all other drones.
+        Broadcasts (n, A, 3) to (n, A, A, 3) so that for each observer drone 'i' (dim 1), 
+        we have the velocities of all target drones 'j' (dim 2).
+        Returns: (n, A, (A-1)*3)
+        """
+        all_vel = self._drone_linvel()    # (n, A, 3)
+        A = NUM_DRONES
+        
+        # Expand observer to dimension 1: (n, 1, A, 3) -> (n, A, A, 3)
+        vel_broadcast = all_vel.unsqueeze(1).expand(-1, A, -1, -1)
+        
+        # Mask out self
+        mask = ~torch.eye(A, dtype=torch.bool, device=self.device)  # (A, A)
+        
+        # Apply mask and reshape
+        return vel_broadcast[:, mask].reshape(all_vel.shape[0], A, (A - 1) * 3)
 
+    def _neighbour_quat(self) -> torch.Tensor:
+        """
+        Orientation (quaternion) of all other drones.
+        Returns: (n, A, (A-1)*4)
+        """
+        all_quat = self._drone_quat()     # (n, A, 4)
+        A = NUM_DRONES
+        
+        # Expand observer to dimension 1: (n, 1, A, 4) -> (n, A, A, 4)
+        quat_broadcast = all_quat.unsqueeze(1).expand(-1, A, -1, -1)
+        
+        # Mask out self
+        mask = ~torch.eye(A, dtype=torch.bool, device=self.device)  # (A, A)
+        
+        return quat_broadcast[:, mask].reshape(all_quat.shape[0], A, (A - 1) * 4)
+ 

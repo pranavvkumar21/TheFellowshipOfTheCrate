@@ -45,29 +45,91 @@ class TerminationManager:
               f"({torch.tensor(self.max_crate_tilt).rad2deg().item():.1f}°)")
         print(f"[TerminationManager] drone pairs tracked: {len(pairs)}")
 
+        self._episode_term_counts: dict[str, torch.Tensor] = {
+        k: torch.zeros(env.num_envs, device=self.device)
+        for k in [
+            "inter_drone_collision",
+            "drone_crate_collision",
+            "drone_ground_collision", 
+            "crate_tip_over",
+            "timeout",
+            ]
+        }
+        self._prev_terminated = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
+        self._prev_timed_out = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
+
+    def _log_new_terminations(
+        self,
+        newly_terminated: torch.Tensor,
+        inter_drone: torch.Tensor,
+        drone_ground: torch.Tensor,
+        crate_tip: torch.Tensor,
+        drone_crate: torch.Tensor,
+    ) -> None:
+        """Increment counters for environments that JUST terminated."""
+        term_ids = newly_terminated.nonzero(as_tuple=True)[0]
+        
+        for env_id in term_ids:
+            if inter_drone[env_id]:
+                self._episode_term_counts["inter_drone_collision"][env_id] += 1
+            elif drone_crate[env_id]:
+                self._episode_term_counts["drone_crate_collision"][env_id] += 1
+            elif drone_ground[env_id]:
+                self._episode_term_counts["drone_ground_collision"][env_id] += 1
+            elif crate_tip[env_id]:
+                self._episode_term_counts["crate_tip_over"][env_id] += 1
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
+    def reset(self, env_ids: torch.Tensor) -> dict[str, float]:
+        """
+        Reset counters for terminating envs and return termination stats.
+        Called by CoopLiftEnv._reset_idx().
+        """
+        logged_stats = {}
+        
+        for cause, count_tensor in self._episode_term_counts.items():
+            # Average count across resetting envs (usually 1 per env)
+            avg_count = torch.mean(count_tensor[env_ids]).item()
+            logged_stats[f"term_{cause}"] = avg_count
+            
+            # Reset counter
+            count_tensor[env_ids] = 0.0
+        
+        # Also reset previous state tracking
+        self._prev_terminated[env_ids] = False
+        self._prev_timed_out[env_ids] = False
+        
+        return logged_stats
     def compute(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """
         Returns:
             terminated: {"drone_i": (num_envs,) bool} — failure termination
             timed_out:  {"drone_i": (num_envs,) bool} — timeout termination
+        Also increments episode counters when terminations occur.
         """
-        terminated = (
-              self._inter_drone_collision()   # (n,) bool
-            # | self._drone_crate_aabb()       # (n,) bool
-            | self._drone_ground_collision()
-            | self._crate_tip_over()
-        )
-
-        timed_out = self._timeout()           # (n,) bool
-
+        # Current termination conditions
+        inter_drone = self._inter_drone_collision()
+        drone_crate = self._drone_crate_aabb()
+        drone_ground = self._drone_ground_collision()
+        crate_tip = self._crate_tip_over()
+        timeout = self._timeout()
+        
+        terminated = inter_drone | drone_ground | crate_tip | drone_crate
+        timed_out = timeout & ~terminated  # Ensure timeout doesn't override failure
+        
+        # NEW: Log NEW terminations that occurred THIS timestep
+        newly_terminated = terminated & ~self._prev_terminated
+        self._log_new_terminations(newly_terminated, inter_drone, drone_ground, crate_tip, drone_crate)
+        
+        self._prev_terminated = terminated.clone()
+        self._prev_timed_out = timed_out.clone()
+        
         return (
             {name: terminated for name in self.env.cfg.possible_agents},
             {name: timed_out  for name in self.env.cfg.possible_agents},
         )
+
 
     def get_termination_info(self) -> dict[str, torch.Tensor]:
         """
@@ -76,7 +138,7 @@ class TerminationManager:
         """
         return {
             "inter_drone_collision" : self._inter_drone_collision(),
-            "drone_crate_collision" : self._drone_crate_collision(),
+            "drone_crate_collision" : self._drone_crate_aabb(),
             "drone_ground_collision": self._drone_ground_collision(),
             "crate_tip_over"        : self._crate_tip_over(),
             "timeout"               : self._timeout(),
