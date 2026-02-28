@@ -44,14 +44,14 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
 
     decimation: int         = 10
     episode_length_s: float = 10.0
-
+    dt = 1/600  # physics timestep (not control timestep, which is dt * decimation)
     possible_agents: list    = [f"drone_{i}" for i in range(NUM_DRONES)]
     action_spaces: dict      = {f"drone_{i}": _ACTION_DIM for i in range(NUM_DRONES)}
     observation_spaces: dict = {f"drone_{i}": _OBS_DIM    for i in range(NUM_DRONES)}
     state_space: int         = -1
 
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 600,
+        dt=dt,
         render_interval=decimation,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -84,7 +84,7 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
     )
 
     # Physics
-    thrust_to_weight: float = 17.5
+    thrust_to_weight: float = 25.0
     moment_scale: float     = 0.01
 
     # Rewards
@@ -103,8 +103,8 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
     crate_size = CRATE_SIZE
     crate_mass_range: tuple = (0.8, 1.0)
 
-    thrust_delta_scale: float = 0.05
-    torque_delta_scale: float = 0.05
+    thrust_delta_scale: float = 0.1
+    torque_delta_scale: float = 0.1
 
     drone_collision_radius: float = 0.15
     drone_crate_radius:     float = 0.25

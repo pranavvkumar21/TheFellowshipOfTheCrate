@@ -81,7 +81,7 @@ from quadcopter_lift_env     import CoopLiftEnv
 from wrapper                 import FlattenedMARLWrapper
 from runner_cfg              import create_runner_cfg
 from registration            import register_envs
-
+from utils.env_info          import print_env_info
 ROOT = Path(__file__).resolve().parent
 
 
@@ -178,6 +178,7 @@ def make_env(num_envs: int, episode_s: float, render_mode=None) -> FlattenedMARL
     cfg.scene.num_envs  = num_envs
     cfg.episode_length_s = episode_s
     base_env = CoopLiftEnv(cfg=cfg, render_mode=render_mode)
+    print_env_info(base_env)
     return FlattenedMARLWrapper(base_env)
 
 

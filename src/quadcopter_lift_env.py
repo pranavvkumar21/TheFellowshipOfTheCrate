@@ -138,6 +138,8 @@ class CoopLiftEnv(DirectMARLEnv):
             for k in ["alive", "crate_height", "goal_dist", "lin_vel", "ang_vel"]
         }
 
+
+
     # -----------------------------------------------------------------------
     def _setup_scene(self):
         # --- One Articulation per drone, registered separately ---
@@ -181,7 +183,7 @@ class CoopLiftEnv(DirectMARLEnv):
                 return
             apis = list(prim.GetAppliedSchemas())
 
-            print(f"{'  ' * depth}{prim.GetPath()}  [{prim.GetTypeName()}]  apis={apis}")
+            # print(f"{'  ' * depth}{prim.GetPath()}  [{prim.GetTypeName()}]  apis={apis}")
             for child in prim.GetChildren():
                 _walk(child, depth + 1)
         _walk(root)
@@ -246,10 +248,10 @@ class CoopLiftEnv(DirectMARLEnv):
         stage = omni.usd.get_context().get_stage()
 
         # --- Debug: print env_0 tree once so you can verify paths ---
-        print("\n[DEBUG] Prim tree for env_0/drone_0:")
-        self._print_prim_tree(f"/World/envs/env_0/drone_0", max_depth=5)
-        print("\n[DEBUG] Prim tree for env_0/crate:")
-        self._print_prim_tree(f"/World/envs/env_0/crate", max_depth=3)
+        # print("\n[DEBUG] Prim tree for env_0/drone_0:")
+        # self._print_prim_tree(f"/World/envs/env_0/drone_0", max_depth=5)
+        # print("\n[DEBUG] Prim tree for env_0/crate:")
+        # self._print_prim_tree(f"/World/envs/env_0/crate", max_depth=3)
 
         # Ensure parent Xform exists
         if not stage.GetPrimAtPath("/World/Joints"):
@@ -292,14 +294,14 @@ class CoopLiftEnv(DirectMARLEnv):
                     max_dist     = self.cfg.rope_max_distance,
                 )
 
-            if env_idx == 0:
-                print(f"\n[DEBUG] env_0 rope joints wired:")
-                print(f"  crate body  → {crate_rb_path}")
-                for i in range(NUM_DRONES):
-                    rb = self._find_rigid_body_path(
-                        f"/World/envs/env_0/drone_{i}"
-                    )
-                    print(f"  drone_{i} body → {rb}")
+            # if env_idx == 0:
+            #     print(f"\n[DEBUG] env_0 rope joints wired:")
+            #     print(f"  crate body  → {crate_rb_path}")
+            #     for i in range(NUM_DRONES):
+            #         rb = self._find_rigid_body_path(
+            #             f"/World/envs/env_0/drone_{i}"
+            #         )
+            #         print(f"  drone_{i} body → {rb}")
         
     # _pre_physics_step:
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
@@ -345,8 +347,13 @@ class CoopLiftEnv(DirectMARLEnv):
 
         #reset action manager state for these envs
         self._action_manager.reset(env_ids)
-        self._reward_manager.reset(env_ids)
+        reward_logs = self._reward_manager.reset(env_ids)
+        term_logs = self._termination_manager.reset(env_ids)
 
+        if "episode" not in self.extras:
+            self.extras["episode"] = {}
+        self.extras["episode"].update(reward_logs)
+        self.extras["episode"].update(term_logs)
         # Create joints ONCE on first reset (after super() initializes physics bodies)
         if not self._joints_created:
             self._create_rope_joints()
@@ -379,9 +386,8 @@ class CoopLiftEnv(DirectMARLEnv):
         crate_state[:, :3] += self.scene.env_origins[env_ids]
         self._crate.write_root_state_to_sim(crate_state, env_ids)
         
-        if 0 in env_ids:
-            print(f"\n[DEBUG RESET] Crate position AFTER reset: {crate_state[0, :3]}")
-            print(f"  Crate Z should be: {self.cfg.crate.init_state.pos[2]} + env_origin_z")
+        # if 0 in env_ids:
+        #     print(f"  Crate Z should be: {self.cfg.crate.init_state.pos[2]} + env_origin_z")
 
         # ------------------------------------------------------------------
         # Reset each drone to its spawn corner — fully vectorised
@@ -427,14 +433,14 @@ class CoopLiftEnv(DirectMARLEnv):
             drone.write_root_pose_to_sim(state[:, :7], env_ids=env_ids)
             drone.write_root_velocity_to_sim(state[:, 7:], env_ids=env_ids)
             
-            if 0 in env_ids and i == 0:
-                idx = (env_ids == 0).nonzero(as_tuple=True)[0][0]
-                print(f"[DEBUG RESET] Drone_0 position AFTER reset: {state[idx, :3]}")
-                print(f"  Expected Z: {self.cfg.crate.init_state.pos[2]} + {self.cfg.crate_size[2]/2} + {self.cfg.rope_length} + 0.02 = {spawn_z[idx]}")
-                crate_attach_z = self.cfg.crate.init_state.pos[2] + self.cfg.crate_size[2]/2
-                drone_attach_z = state[idx, 2] - 0.02
-                rope_dist = drone_attach_z - crate_attach_z
-                print(f"  Rope attachment distance: {rope_dist:.3f}m (should be {self.cfg.rope_length}m)\n")
+            # if 0 in env_ids and i == 0:
+            #     idx = (env_ids == 0).nonzero(as_tuple=True)[0][0]
+            #     print(f"[DEBUG RESET] Drone_0 position AFTER reset: {state[idx, :3]}")
+            #     print(f"  Expected Z: {self.cfg.crate.init_state.pos[2]} + {self.cfg.crate_size[2]/2} + {self.cfg.rope_length} + 0.02 = {spawn_z[idx]}")
+            #     crate_attach_z = self.cfg.crate.init_state.pos[2] + self.cfg.crate_size[2]/2
+            #     drone_attach_z = state[idx, 2] - 0.02
+            #     rope_dist = drone_attach_z - crate_attach_z
+            #     print(f"  Rope attachment distance: {rope_dist:.3f}m (should be {self.cfg.rope_length}m)\n")
 
         # ------------------------------------------------------------------
         # Clear buffers
