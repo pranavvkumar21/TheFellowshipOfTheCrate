@@ -9,47 +9,37 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab_assets import CRAZYFLIE_CFG
 
+from isaaclab.sensors import ContactSensorCfg
+
 NUM_DRONES: int = 4
 _ACTION_DIM: int = 4   # [thrust, mx, my, mz]
-_OBS_DIM: int = 26     # placeholder
+_OBS_DIM: int = 70     # placeholder
 CRATE_SIZE: tuple = (0.4, 0.4, 0.2)   # (x, y, z) in metres
 
-# Drone spawn corner offsets per env (x, y, z)
-# DRONE_INIT_POSITIONS = [
-#     ( 0.2,  0.2, 1.7),
-#     (-0.2,  0.2, 1.7),
-#     (-0.2, -0.2, 1.7),
-#     ( 0.2, -0.2, 1.7),
-# ]
-# # Rope attachment points on crate top face (crate-local frame)
-# ROPE_ATTACH_OFFSETS = [
-#     ( 0.18,  0.18, 0.10),
-#     (-0.18,  0.18, 0.10),
-#     (-0.18, -0.18, 0.10),
-#     ( 0.18, -0.18, 0.10),
-# ]
 def _make_drone_cfg(pos: tuple, id: int) -> ArticulationCfg:
     ox, oy, oz = pos
     return CRAZYFLIE_CFG.replace(
-        prim_path=f"/World/envs/env_.*/drone_{id}",
-        init_state=ArticulationCfg.InitialStateCfg(
-            pos=(ox, oy, oz),
-            rot=(1.0, 0.0, 0.0, 0.0),
-        ),
-    )
-
+    prim_path=f"/World/envs/env_.*/drone_{id}",
+    spawn=CRAZYFLIE_CFG.spawn.replace(activate_contact_sensors=True), # MOVE HERE
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(ox, oy, oz),
+        rot=(1.0, 0.0, 0.0, 0.0),
+    ),
+)
 
 @configclass
 class CoopLiftEnvCfg(DirectMARLEnvCfg):
 
-    decimation: int         = 10
-    episode_length_s: float = 10.0
-    dt = 1/600  # physics timestep (not control timestep, which is dt * decimation)
+    # ── Core ──────────────────────────────────────────────────────────────
+    decimation: int          = 10
+    episode_length_s: float  = 10.0
+    dt                       = 1/600
     possible_agents: list    = [f"drone_{i}" for i in range(NUM_DRONES)]
     action_spaces: dict      = {f"drone_{i}": _ACTION_DIM for i in range(NUM_DRONES)}
     observation_spaces: dict = {f"drone_{i}": _OBS_DIM    for i in range(NUM_DRONES)}
     state_space: int         = -1
 
+    # ── Simulation ────────────────────────────────────────────────────────
     sim: SimulationCfg = SimulationCfg(
         dt=dt,
         render_interval=decimation,
@@ -68,6 +58,7 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
         replicate_physics=True,
     )
 
+    # ── Crate ─────────────────────────────────────────────────────────────
     crate: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/crate",
         spawn=sim_utils.CuboidCfg(
@@ -76,46 +67,79 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
             mass_props=sim_utils.MassPropertiesCfg(mass=2.0),
             collision_props=sim_utils.CollisionPropertiesCfg(),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.6, 0.4, 0.1)),
+            activate_contact_sensors=True,
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=(0.0, 0.0, 0.1),
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
+        
+    )
+    crate_size                = CRATE_SIZE
+    crate_mass_range: tuple   = (1.5, 2.5)
+
+    # ── Contact Sensors ───────────────────────────────────────────────────
+    drone_0_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/drone_0/body",
+        filter_prim_paths_expr=[
+            "/World/envs/env_.*/crate",
+            "/World/ground",
+        ],
+        history_length=2,
+        track_air_time=False,
+    )
+    drone_1_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/drone_1/body",
+        filter_prim_paths_expr=[
+            "/World/envs/env_.*/crate",
+            "/World/ground",
+        ],
+        history_length=2,
+        track_air_time=False,
+    )
+    drone_2_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/drone_2/body",
+        filter_prim_paths_expr=[
+            "/World/envs/env_.*/crate",
+            "/World/ground",
+        ],
+        history_length=2,
+        track_air_time=False,
+    )
+    drone_3_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/drone_3/body",
+        filter_prim_paths_expr=[
+            "/World/envs/env_.*/crate",
+            "/World/ground",
+        ],
+        history_length=2,
+        track_air_time=False,
+    )
+    crate_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/crate",
+        filter_prim_paths_expr=["/World/ground"],
+        history_length=2,
+        track_air_time=False,
     )
 
-    # Physics
-    thrust_to_weight: float = 25.0
-    moment_scale: float     = 0.01
+    # ── Physics / Actions ─────────────────────────────────────────────────
+    thrust_to_weight: float    = 25.0
+    moment_scale: float        = 0.01
+    thrust_delta_scale: float  = 0.02
+    torque_delta_scale: float  = 0.05
 
-    # Rewards
-    rew_scale_alive:        float =  1.0
-    rew_scale_terminated:   float = -2.0
-    rew_scale_crate_height: float =  5.0
-    rew_scale_goal_dist:    float = 10.0
-    rew_scale_lin_vel:      float = -0.05
-    rew_scale_ang_vel:      float = -0.01
-
-    # Termination
-    max_drone_height: float = 5.0
-    min_drone_height: float = 0.05
-    goal_pos: tuple         = (0.0, 0.0, 1.5)
-
-    crate_size = CRATE_SIZE
-    crate_mass_range: tuple = (0.8, 1.0)
-
-    thrust_delta_scale: float = 0.1
-    torque_delta_scale: float = 0.1
-
+    # ── Termination ───────────────────────────────────────────────────────
+    max_drone_height: float       = 8.0
+    max_crate_tilt: float         = 1.05   # 60 degrees
     drone_collision_radius: float = 0.15
-    drone_crate_radius:     float = 0.25
-    max_crate_tilt:         float = 0.524
+    reset_grace_steps: int        = 120
+    goal_pos: tuple               = (0.0, 0.0, 1.5)
 
-    # ── Set rope_length here. Everything else is derived in __post_init__ ──
-    rope_length: float = 0.5
-    rope_length_tolerance: float = 0.05  # ±5cm around rope_length
-    reset_grace_steps: int = 120  # ~2s at 60Hz control (no termination after reset)
+    # ── Rope ──────────────────────────────────────────────────────────────
+    rope_length: float           = 0.5
+    rope_length_tolerance: float = 0.05
 
-    # Placeholders — populated by __post_init__, do NOT set manually
+    # ── Placeholders — set in __post_init__, do NOT set manually ──────────
     rope_max_distance:    float = 0.0
     DRONE_INIT_POSITIONS: list  = field(default_factory=list)
     ROPE_ATTACH_OFFSETS:  list  = field(default_factory=list)
@@ -126,19 +150,12 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
     drone_3: ArticulationCfg = None  # type: ignore
 
     def __post_init__(self):
-        # ── Fixed crate geometry ──────────────────────────────────────────
-        crate_centre_z = self.crate.init_state.pos[2]   # 0.1
-        half_z  = self.crate.spawn.size[2] / 2          # 0.1
-        half_xy = self.crate.spawn.size[0] / 2          # 0.2
+        crate_centre_z       = self.crate.init_state.pos[2]
+        half_z               = self.crate.spawn.size[2] / 2
+        half_xy              = self.crate.spawn.size[0] / 2
+        drone_attach_offset  = 0.02
+        drone_z              = crate_centre_z + half_z + self.rope_length + drone_attach_offset
 
-        # ── Account for rope attachment offsets when positioning drones ────
-        # Crate attachment is at +half_z from crate center (top face)
-        # Drone attachment is at -0.02 from drone center (2cm below)
-        # So drone must be higher by 0.02m to maintain rope_length distance
-        drone_attachment_offset = 0.02
-        drone_z = crate_centre_z + half_z + self.rope_length + drone_attachment_offset
-
-        # ── Derived geometry ──────────────────────────────────────────────
         self.DRONE_INIT_POSITIONS = [
             ( half_xy,  half_xy, drone_z),
             (-half_xy,  half_xy, drone_z),
@@ -151,11 +168,8 @@ class CoopLiftEnvCfg(DirectMARLEnvCfg):
             (-half_xy, -half_xy, half_z),
             ( half_xy, -half_xy, half_z),
         ]
-        # PhysX only supports max distance on D6 joints, not min
-        # So rope_max_distance is the hard limit the rope can't exceed
         self.rope_max_distance = self.rope_length
 
-        # ── Rebuild ArticulationCfgs with correct spawn heights ───────────
         self.drone_0 = _make_drone_cfg(self.DRONE_INIT_POSITIONS[0], 0)
         self.drone_1 = _make_drone_cfg(self.DRONE_INIT_POSITIONS[1], 1)
         self.drone_2 = _make_drone_cfg(self.DRONE_INIT_POSITIONS[2], 2)

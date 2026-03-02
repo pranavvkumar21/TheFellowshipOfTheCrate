@@ -10,6 +10,8 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectMARLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.sensors import ContactSensor
+
 
 from Managers import ObservationManager, ActionManager, TerminationManager, RewardManager, CommandManager
 from quadcopter_lift_env_cfg import (
@@ -86,7 +88,7 @@ class CoopLiftEnv(DirectMARLEnv):
         #         f"cfg={self.cfg.observation_spaces['drone_0']}"
         # )
         
-
+        self.curriculum = 0  # track curriculum stage for potential use in managers
         # Body id for force application — same "body" link on every Crazyflie
         # Each Articulation has one instance per env, so find_bodies returns
         # a list with one index.
@@ -155,6 +157,17 @@ class CoopLiftEnv(DirectMARLEnv):
         # --- Ground ---
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
+        # --- Contact Sensors ---
+        self._contact_sensors: dict[str, ContactSensor] = {}
+        for i in range(NUM_DRONES):
+            name   = f"drone_{i}_contact"
+            sensor = ContactSensor(getattr(self.cfg, name))
+            self._contact_sensors[name] = sensor
+            self.scene.sensors[name]    = sensor
+
+        self._crate_contact = ContactSensor(self.cfg.crate_contact)
+        self.scene.sensors["crate_contact"] = self._crate_contact
+
         # --- Clone BEFORE joints ---
         self.scene.clone_environments(copy_from_source=False)
 
@@ -167,7 +180,21 @@ class CoopLiftEnv(DirectMARLEnv):
 
         # --- Rope joints will be created on first reset when bodies exist ---
         self._joints_created = False
+
     # -----------------------------------------------------------------------
+    def _update_curriculum(self):
+        """Slowly ramp curriculum based on mean goal_dist reward across envs."""
+        mean_perf = torch.exp(-1.0 * (
+            self._goal_pos_w[:, 2] - self._crate.data.root_pos_w[:, 2]
+        ).clamp(min=0.0)).mean().item()   # 0→1, 1 = crate at goal
+
+        # Exponential moving average — tau controls how fast it responds
+        tau = 0.001   # ~1000 steps to fully shift
+        if mean_perf > 0.5:      # only advance when doing reasonably well
+            self.curriculum = min(1.0, self.curriculum + tau)
+        else:
+            self.curriculum = max(0.0, self.curriculum - tau * 0.5)  # decay slower
+
     def _print_prim_tree(self, root_path: str, max_depth: int = 4):
         """Debug helper — call once to see actual prim tree after cloning."""
         stage = omni.usd.get_context().get_stage()
@@ -353,7 +380,9 @@ class CoopLiftEnv(DirectMARLEnv):
         if "episode" not in self.extras:
             self.extras["episode"] = {}
         self.extras["episode"].update(reward_logs)
+        # TODO: add curriculum stage to extras for logging
         self.extras["episode"].update(term_logs)
+        # self.extras.setdefault("curriculum", ).append(self.curriculum)
         # Create joints ONCE on first reset (after super() initializes physics bodies)
         if not self._joints_created:
             self._create_rope_joints()
@@ -366,17 +395,26 @@ class CoopLiftEnv(DirectMARLEnv):
         # without invalidating PhysX's tensor view. Mass is safe because it
         # is written via the physics tensor API, not by modifying USD prims.
         # ------------------------------------------------------------------
-        mass_min, mass_max = self.cfg.crate_mass_range
-        new_masses = torch.empty(n, device="cpu").uniform_(mass_min, mass_max)
+        """disabling for now to keep things simple while we focus on getting the system working
+        TODO: implement proper curriculum with mass randomisation once the system is working end-to-end
+        """
+        # mass_min, mass_max = self.cfg.crate_mass_range
+        # new_masses = torch.empty(n, device="cpu").uniform_(mass_min, mass_max)
 
-        # get_masses / set_masses operate on CPU tensors
-        masses = self._crate.root_physx_view.get_masses()   # shape (num_envs, 1)
-        masses[env_ids, 0] = new_masses
+        # # get_masses / set_masses operate on CPU tensors
+        # masses = self._crate.root_physx_view.get_masses()   # shape (num_envs, 1)
+        # masses[env_ids, 0] = new_masses
+        # self._crate.root_physx_view.set_masses(masses, torch.arange(self.num_envs, device="cpu"))
+
+        # # Store for obs use (broadcast to match num_envs dim)
+        # self._crate_mass[env_ids] = new_masses.to(self.device)
+        # After — fixed mass, no randomization
+        FIXED_MASS = 2.0
+        masses = self._crate.root_physx_view.get_masses()
+        masses[env_ids, 0] = FIXED_MASS
         self._crate.root_physx_view.set_masses(masses, torch.arange(self.num_envs, device="cpu"))
 
-        # Store for obs use (broadcast to match num_envs dim)
-        self._crate_mass[env_ids] = new_masses.to(self.device)
-
+        self._crate_mass[env_ids] = FIXED_MASS
         # ------------------------------------------------------------------
         # Reset crate pose — fixed geometry, explicit position
         # ------------------------------------------------------------------

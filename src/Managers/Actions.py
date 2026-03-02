@@ -46,9 +46,9 @@ class ActionManager:
 
         # Delta scales: how much one unit of network output changes the state
         # Thrust delta: fraction of hover thrust per step
-        self._thrust_delta_scale = env.cfg.thrust_delta_scale   # e.g. 0.05
+        self._thrust_delta_scale = env.cfg.thrust_delta_scale * self._max_thrust   # e.g. 0.05
         # Torque delta: fraction of max torque per step
-        self._torque_delta_scale = env.cfg.torque_delta_scale   # e.g. 0.05
+        self._torque_delta_scale = env.cfg.torque_delta_scale * self._max_torque   # e.g. 0.05
 
         # Internal residual state: (num_envs, NUM_DRONES, 4)
         # [:, :, 0] = current thrust per drone per env
@@ -73,9 +73,16 @@ class ActionManager:
         return self.ACTION_DIM
 
     def reset(self, env_ids: torch.Tensor) -> None:
-        """Reset residual state to hover thrust for given envs."""
         self._state[env_ids] = 0.0
-        self._state[env_ids, :, 0] = self._hover_thrust
+        
+        # Each drone needs to support its own weight + share of crate
+        crate_mass = self.env._crate_mass[env_ids]  # (n,)
+        gravity = 9.81
+        crate_share = (crate_mass * gravity / NUM_DRONES).unsqueeze(1)  # (n, 1)
+        
+        total_thrust = self._hover_thrust + crate_share  # (n, 1)
+        noise = torch.randn_like(self._state[env_ids, :, 0]) * 0.05 * self._hover_thrust
+        self._state[env_ids, :, 0] = (total_thrust.expand(-1, NUM_DRONES) + noise).clamp(0, self._max_thrust)
 
     def step(self, actions: dict[str, torch.Tensor]) -> None:
         """
