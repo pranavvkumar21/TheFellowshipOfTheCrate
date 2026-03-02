@@ -8,7 +8,7 @@ import torch
 
 GOAL_X_RANGE = (-1.0,  1.0)   # metres from env origin
 GOAL_Y_RANGE = (-1.0,  1.0)
-GOAL_Z_MIN   =  1.2            # minimum lift height
+GOAL_Z_MIN   =  0.4            # minimum lift height
 GOAL_Z_MAX   =  2.5            # maximum lift height
 
 # How close the crate must be to count as success (metres)

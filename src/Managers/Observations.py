@@ -25,18 +25,20 @@ class ObservationManager:
 
     # Registry: (name, feature_dim)
     # Order here defines concatenation order in the final obs vector.
-    _TERM_REGISTRY: list[tuple[str, int]] = [
-        ("drone_pos",           3),   # drone world position (absolute)
-        ("drone_quat",          4),   # drone orientation (world frame)
-        ("drone_linvel",        3),   # drone linear velocity (world frame)
-        ("crate_rel_pos",       3),   # crate pos relative to this drone
-        ("crate_abs_vel",       3),   # crate linear velocity (world frame, absolute)
-        ("crate_quat",          4),   # crate orientation (world frame)
-        ("goal_rel_pos",        3),   # goal pos relative to crate (command error)
-        ("goal_abs_vel_error",  3),   # crate velocity in direction of goal (abs)
-        ("neighbour_rel_pos", (NUM_DRONES - 1) * 3),  # relative pos of other drones
-        ("neighbour_linvel",   (NUM_DRONES - 1) * 3),  # absolute linvel of other drones
-        ("neighbour_quat",     (NUM_DRONES - 1) * 4),  # absolute orientation of other drones
+    _TERM_REGISTRY = [
+        ("drone_quat",             4),
+        ("drone_linvel",           3),
+        ("crate_rel_pos",          3),
+        ("crate_height",           1),   # absolute Z of crate
+        ("crate_abs_vel",          3),
+        ("crate_quat",             4),
+        ("goal_rel_pos",           3),
+        ("goal_abs_vel_error",     3),
+        ("action_state",           4),
+        ("neighbour_rel_pos",      (NUM_DRONES-1)*3),
+        ("neighbour_linvel",       (NUM_DRONES-1)*3),
+        ("neighbour_quat",         (NUM_DRONES-1)*4),
+        ("neighbour_action_state", (NUM_DRONES-1)*4),
     ]
 
     def __init__(self, env):
@@ -70,18 +72,38 @@ class ObservationManager:
         Returns per-agent obs dict: {"drone_i": (num_envs, obs_dim)}
         Internally computes (num_envs, NUM_DRONES, obs_dim) then splits.
         """
+        for name, tensor in [
+            ("drone_quat",             self._drone_quat()),
+            ("drone_linvel",           self._drone_linvel()),
+            ("crate_rel_pos",          self._crate_rel_pos()),
+            ("crate_height",           self._crate_height()),
+            ("crate_abs_vel",          self._crate_abs_vel()),
+            ("crate_quat",             self._crate_quat()),
+            ("goal_rel_pos",           self._goal_rel_pos()),
+            ("goal_abs_vel_error",     self._goal_abs_vel_error()),
+            ("action_state",           self._action_state()),
+            ("neighbour_rel_pos",      self._neighbour_rel_pos()),
+            ("neighbour_linvel",       self._neighbour_linvel()),
+            ("neighbour_quat",         self._neighbour_quat()),
+            ("neighbour_action_state", self._neighbour_action_state()),
+        ]:
+            if not tensor.isfinite().all():
+                print(f"BAD TERM: {name} — min={tensor.min():.3f} max={tensor.max():.3f}")
+
         full_obs = torch.cat([
-            self._drone_pos(),           # (n, A, 3)
-            self._drone_quat(),          # (n, A, 4)
-            self._drone_linvel(),        # (n, A, 3)
-            self._crate_rel_pos(),       # (n, A, 3)
-            self._crate_abs_vel(),       # (n, A, 3)
-            self._crate_quat(),          # (n, A, 4)
-            self._goal_rel_pos(),        # (n, A, 3)
-            self._goal_abs_vel_error(),  # (n, A, 3)
-            self._neighbour_rel_pos(),   # (n, A, (A-1)*3)
-            self._neighbour_linvel(),     # (n, A, (A-1)*3)
-            self._neighbour_quat(),       # (n, A, (A-1)*4)
+            self._drone_quat(),              # 4
+            self._drone_linvel(),            # 3
+            self._crate_rel_pos(),           # 3
+            self._crate_height(),            # 1  ← right after crate_rel_pos
+            self._crate_abs_vel(),           # 3
+            self._crate_quat(),              # 4
+            self._goal_rel_pos(),            # 3
+            self._goal_abs_vel_error(),      # 3
+            self._action_state(),            # 4  ← before neighbours
+            self._neighbour_rel_pos(),       # 9
+            self._neighbour_linvel(),        # 9
+            self._neighbour_quat(),          # 12
+            self._neighbour_action_state(),  # 12
         ], dim=-1)  # (n, A, obs_dim)
 
         return {
@@ -187,49 +209,47 @@ class ObservationManager:
 
         return self._broadcast_crate(vel_error)                   # (n, A, 3)
     def _neighbour_rel_pos(self) -> torch.Tensor:
-        all_pos = self._all_drone_pos()   # (n, A, 3)
-
-        # Build (n, A, A, 3): all pairwise differences
-        pairwise = all_pos.unsqueeze(2) - all_pos.unsqueeze(1)   # (n, A, A, 3)
-
-        # Mask out self (diagonal) and flatten remaining A-1 neighbours
+        all_pos = self._all_drone_pos()  # (n, A, 3)
         A = NUM_DRONES
-        mask = ~torch.eye(A, dtype=torch.bool, device=self.device)   # (A, A)
-        
-        # FIX: Apply the 2D mask directly to dims 1 and 2
-        return pairwise[:, mask].reshape(pairwise.shape[0], A, (A - 1) * 3)
+        pairwise = all_pos.unsqueeze(2) - all_pos.unsqueeze(1)  # (n, A, A, 3)
+        result = []
+        for i in range(A):
+            others = [j for j in range(A) if j != i]
+            result.append(pairwise[:, i, others, :].reshape(pairwise.shape[0], (A-1)*3))
+        return torch.stack(result, dim=1)  # (n, A, (A-1)*3)
+
+    def _action_state(self) -> torch.Tensor:
+        # (n, A, 4) — normalised so thrust in [0,1], torques in [-1,1]
+        return self.env._action_manager.get_state_normalised()
     def _neighbour_linvel(self) -> torch.Tensor:
-        """
-        Absolute linear velocity of all other drones.
-        Broadcasts (n, A, 3) to (n, A, A, 3) so that for each observer drone 'i' (dim 1), 
-        we have the velocities of all target drones 'j' (dim 2).
-        Returns: (n, A, (A-1)*3)
-        """
-        all_vel = self._drone_linvel()    # (n, A, 3)
+        all_vel = self._drone_linvel()  # (n, A, 3)
         A = NUM_DRONES
-        
-        # Expand observer to dimension 1: (n, 1, A, 3) -> (n, A, A, 3)
-        vel_broadcast = all_vel.unsqueeze(1).expand(-1, A, -1, -1)
-        
-        # Mask out self
-        mask = ~torch.eye(A, dtype=torch.bool, device=self.device)  # (A, A)
-        
-        # Apply mask and reshape
-        return vel_broadcast[:, mask].reshape(all_vel.shape[0], A, (A - 1) * 3)
+        result = []
+        for i in range(A):
+            others = [j for j in range(A) if j != i]
+            result.append(all_vel[:, others, :].reshape(all_vel.shape[0], (A-1)*3))
+        return torch.stack(result, dim=1)  # (n, A, (A-1)*3)
 
     def _neighbour_quat(self) -> torch.Tensor:
-        """
-        Orientation (quaternion) of all other drones.
-        Returns: (n, A, (A-1)*4)
-        """
-        all_quat = self._drone_quat()     # (n, A, 4)
+        all_quat = self._drone_quat()  # (n, A, 4)
+        A = NUM_DRONES
+        result = []
+        for i in range(A):
+            others = [j for j in range(A) if j != i]
+            result.append(all_quat[:, others, :].reshape(all_quat.shape[0], (A-1)*4))
+        return torch.stack(result, dim=1)  # (n, A, (A-1)*4)
+    def _neighbour_action_state(self) -> torch.Tensor:
+        action_state = self.env._action_manager.get_state_normalised()  # (n, A, 4)
         A = NUM_DRONES
         
-        # Expand observer to dimension 1: (n, 1, A, 4) -> (n, A, A, 4)
-        quat_broadcast = all_quat.unsqueeze(1).expand(-1, A, -1, -1)
+        # Same pattern as neighbour_linvel
+        action_broadcast = action_state.unsqueeze(1).expand(-1, A, -1, -1)  # (n, A, A, 4)
         
-        # Mask out self
-        mask = ~torch.eye(A, dtype=torch.bool, device=self.device)  # (A, A)
-        
-        return quat_broadcast[:, mask].reshape(all_quat.shape[0], A, (A - 1) * 4)
- 
+        result = []
+        for i in range(A):
+            others = [j for j in range(A) if j != i]
+            result.append(action_broadcast[:, i, others, :].reshape(action_state.shape[0], (A-1)*4))
+        return torch.stack(result, dim=1)  # (n, A, (A-1)*4)
+    def _crate_height(self) -> torch.Tensor:
+        z = self.env._crate.data.root_pos_w[:, 2:3]  # (n, 1)
+        return self._broadcast_crate(z)               # (n, A, 1)
