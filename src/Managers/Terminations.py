@@ -4,256 +4,173 @@ from quadcopter_lift_env_cfg import NUM_DRONES
 
 
 class TerminationManager:
-    """
-    Termination conditions for cooperative lift.
-
-    Tracks two separate signals per env:
-        terminated: episode ends, counts as failure (crashed, collided, tipped)
-        timed_out:  episode ends, does NOT count as failure (max steps reached)
-
-    Conditions:
-        1. Inter-drone collision     — any two drones closer than collision_radius
-        2. Drone-crate collision     — any drone closer than drone_crate_radius to crate surface
-        3. Drone-ground collision    — any drone below min_drone_height
-        4. Crate tip-over            — crate orientation deviates beyond max_crate_tilt
-        5. Timeout                   — episode_length_buf >= max_episode_length - 1
-    """
 
     def __init__(self, env):
         self.env    = env
         self.device = env.device
 
-        # Collision radii
-        self.drone_drone_radius: float = env.cfg.drone_collision_radius   # e.g. 0.15 m
-        self.drone_crate_radius: float = env.cfg.drone_crate_radius       # e.g. 0.20 m
+        self.drone_drone_radius: float = env.cfg.drone_collision_radius
+        self.max_drone_height: float   = env.cfg.max_drone_height
+        self.max_crate_tilt: float     = env.cfg.max_crate_tilt
 
-        # Height bounds
-        self.min_drone_height: float = env.cfg.min_drone_height           # e.g. 0.05 m
-        self.max_drone_height: float = env.cfg.max_drone_height           # e.g. 5.0  m
-
-        # Crate tilt limit (radians) — angle between crate up-axis and world up-axis
-        self.max_crate_tilt: float = env.cfg.max_crate_tilt               # e.g. 0.52 rad (30°)
-
-        # Precompute all unique drone pairs — shape (num_pairs, 2)
-        # For 4 drones: (0,1), (0,2), (0,3), (1,2), (1,3), (2,3) → 6 pairs
         pairs = [(i, j) for i in range(NUM_DRONES) for j in range(i + 1, NUM_DRONES)]
-        self._pair_idx = torch.tensor(pairs, device=self.device)   # (num_pairs, 2)
+        self._pair_idx = torch.tensor(pairs, device=self.device)   # (6, 2)
+
+        self._episode_term_counts: dict[str, torch.Tensor] = {
+            k: torch.zeros(env.num_envs, device=self.device)
+            for k in [
+                "inter_drone_collision",
+                "drone_crate_contact",
+                "drone_ground_contact",
+                "crate_ground_contact",
+                "crate_tip_over",
+                "drone_too_high",
+                "timeout",
+            ]
+        }
+        self._prev_terminated = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
 
         print(f"[TerminationManager] drone_drone_radius = {self.drone_drone_radius} m")
-        print(f"[TerminationManager] drone_crate_radius = {self.drone_crate_radius} m")
         print(f"[TerminationManager] max_crate_tilt     = {self.max_crate_tilt:.3f} rad "
               f"({torch.tensor(self.max_crate_tilt).rad2deg().item():.1f}°)")
         print(f"[TerminationManager] drone pairs tracked: {len(pairs)}")
 
-        self._episode_term_counts: dict[str, torch.Tensor] = {
-        k: torch.zeros(env.num_envs, device=self.device)
-        for k in [
-            "inter_drone_collision",
-            "drone_crate_collision",
-            "drone_ground_collision", 
-            "crate_tip_over",
-            "timeout",
-            ]
-        }
-        self._prev_terminated = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
-        self._prev_timed_out = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
-
-    def _log_new_terminations(
-        self,
-        newly_terminated: torch.Tensor,
-        inter_drone: torch.Tensor,
-        drone_ground: torch.Tensor,
-        crate_tip: torch.Tensor,
-        drone_crate: torch.Tensor,
-    ) -> None:
-        """Increment counters for environments that JUST terminated."""
-        term_ids = newly_terminated.nonzero(as_tuple=True)[0]
-        
-        for env_id in term_ids:
-            if inter_drone[env_id]:
-                self._episode_term_counts["inter_drone_collision"][env_id] += 1
-            elif drone_crate[env_id]:
-                self._episode_term_counts["drone_crate_collision"][env_id] += 1
-            elif drone_ground[env_id]:
-                self._episode_term_counts["drone_ground_collision"][env_id] += 1
-            elif crate_tip[env_id]:
-                self._episode_term_counts["crate_tip_over"][env_id] += 1
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
     def reset(self, env_ids: torch.Tensor) -> dict[str, float]:
-        """
-        Reset counters for terminating envs and return termination stats.
-        Called by CoopLiftEnv._reset_idx().
-        """
         logged_stats = {}
-        
         for cause, count_tensor in self._episode_term_counts.items():
-            # Average count across resetting envs (usually 1 per env)
-            avg_count = torch.mean(count_tensor[env_ids]).item()
-            logged_stats[f"term_{cause}"] = avg_count
-            
-            # Reset counter
+            logged_stats[f"term_{cause}"] = torch.mean(count_tensor[env_ids]).item()
             count_tensor[env_ids] = 0.0
-        
-        # Also reset previous state tracking
         self._prev_terminated[env_ids] = False
-        self._prev_timed_out[env_ids] = False
-        
         return logged_stats
+
     def compute(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """
-        Returns:
-            terminated: {"drone_i": (num_envs,) bool} — failure termination
-            timed_out:  {"drone_i": (num_envs,) bool} — timeout termination
-        Also increments episode counters when terminations occur.
-        """
-        # Current termination conditions
-        inter_drone = self._inter_drone_collision()
-        drone_crate = self._drone_crate_aabb()
-        drone_ground = self._drone_ground_collision()
-        crate_tip = self._crate_tip_over()
-        timeout = self._timeout()
-        
-        terminated = inter_drone | drone_ground | crate_tip | drone_crate
-        timed_out = timeout & ~terminated  # Ensure timeout doesn't override failure
-        
-        # NEW: Log NEW terminations that occurred THIS timestep
+        grace = self.env.episode_length_buf < self.env.cfg.reset_grace_steps
+
+        inter_drone    = self._inter_drone_collision()
+        drone_crate    = self._drone_crate_contact()
+        drone_ground   = self._drone_ground_contact() #& ~grace
+        crate_ground   = self._crate_ground_contact() #& ~grace
+        drone_too_high = self._drone_too_high()
+        crate_tip      = self._crate_tip_over()
+        timeout        = self._timeout()
+
+        terminated = inter_drone | drone_crate | drone_ground | drone_too_high | crate_tip
+        timed_out  = timeout & ~terminated
+
         newly_terminated = terminated & ~self._prev_terminated
-        self._log_new_terminations(newly_terminated, inter_drone, drone_ground, crate_tip, drone_crate)
-        
+        self._log_new_terminations(
+            newly_terminated, inter_drone, drone_crate,
+            drone_ground, crate_ground, drone_too_high, crate_tip
+        )
         self._prev_terminated = terminated.clone()
-        self._prev_timed_out = timed_out.clone()
-        
+
         return (
             {name: terminated for name in self.env.cfg.possible_agents},
             {name: timed_out  for name in self.env.cfg.possible_agents},
         )
 
-
     def get_termination_info(self) -> dict[str, torch.Tensor]:
-        """
-        Returns individual condition tensors for logging/reward shaping.
-        Each is shape (num_envs,) bool.
-        """
+        grace = self.env.episode_length_buf < self.env.cfg.reset_grace_steps
         return {
             "inter_drone_collision" : self._inter_drone_collision(),
-            "drone_crate_collision" : self._drone_crate_aabb(),
-            "drone_ground_collision": self._drone_ground_collision(),
+            "drone_crate_contact"   : self._drone_crate_contact(),
+            # "drone_ground_contact"  : self._drone_ground_contact() & ~grace,
+            "crate_ground_contact"  : self._crate_ground_contact() & ~grace,
+            "drone_too_high"        : self._drone_too_high(),
             "crate_tip_over"        : self._crate_tip_over(),
             "timeout"               : self._timeout(),
         }
 
     # ------------------------------------------------------------------
-    # Termination conditions — each returns (num_envs,) bool
+    # Logging
+    # ------------------------------------------------------------------
+
+    def _log_new_terminations(
+        self,
+        newly_terminated: torch.Tensor,
+        inter_drone:    torch.Tensor,
+        drone_crate:    torch.Tensor,
+        drone_ground:   torch.Tensor,
+        crate_ground:   torch.Tensor,
+        drone_too_high: torch.Tensor,
+        crate_tip:      torch.Tensor,
+    ) -> None:
+        term_ids = newly_terminated.nonzero(as_tuple=True)[0]
+        for env_id in term_ids:
+            if inter_drone[env_id]:
+                self._episode_term_counts["inter_drone_collision"][env_id] += 1
+            elif drone_crate[env_id]:
+                self._episode_term_counts["drone_crate_contact"][env_id] += 1
+            elif drone_ground[env_id]:
+                self._episode_term_counts["drone_ground_contact"][env_id] += 1
+            elif crate_ground[env_id]:
+                self._episode_term_counts["crate_ground_contact"][env_id] += 1
+            elif drone_too_high[env_id]:
+                self._episode_term_counts["drone_too_high"][env_id] += 1
+            elif crate_tip[env_id]:
+                self._episode_term_counts["crate_tip_over"][env_id] += 1
+
+    # ------------------------------------------------------------------
+    # Conditions
     # ------------------------------------------------------------------
 
     def _all_drone_pos(self) -> torch.Tensor:
-        """Stack all drone positions. Shape: (n, A, 3)"""
         return torch.stack(
-            [self.env._drones[f"drone_{i}"].data.root_pos_w
-             for i in range(NUM_DRONES)],
+            [self.env._drones[f"drone_{i}"].data.root_pos_w for i in range(NUM_DRONES)],
             dim=1,
-        )   # (n, A, 3)
+        )   # (n, 4, 3)
 
     def _inter_drone_collision(self) -> torch.Tensor:
-        """
-        True if any pair of drones are within drone_drone_radius of each other.
-
-        Pairwise distances: (n, num_pairs)
-        Uses precomputed pair index to avoid full (A x A) matrix.
-        """
-        pos = self._all_drone_pos()   # (n, A, 3)
-
-        # Gather positions for each side of every pair
-        idx_a = self._pair_idx[:, 0]   # (num_pairs,)
+        pos   = self._all_drone_pos()                          # (n, 4, 3)
+        idx_a = self._pair_idx[:, 0]
         idx_b = self._pair_idx[:, 1]
+        dist  = (pos[:, idx_a] - pos[:, idx_b]).norm(dim=-1)  # (n, 6)
+        return (dist < self.drone_drone_radius).any(dim=-1)    # (n,)
 
-        pos_a = pos[:, idx_a, :]       # (n, num_pairs, 3)
-        pos_b = pos[:, idx_b, :]       # (n, num_pairs, 3)
+    def _drone_crate_contact(self) -> torch.Tensor:
+        any_contact = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+        for i in range(NUM_DRONES):
+            sensor = self.env._contact_sensors[f"drone_{i}_contact"]
+            # (num_envs, num_bodies=1, num_filters, 3)
+            force_mat = sensor.data.force_matrix_w              # uses filter_prim_paths_expr[web:19][web:25]
+            if force_mat is None:
+                continue
+            crate_force = force_mat[:, 0, 0, :]                 # body 0, filter 0 = crate
+            any_contact |= crate_force.norm(dim=-1) > 0.1
+        return any_contact
 
-        dist = (pos_a - pos_b).norm(dim=-1)   # (n, num_pairs)
 
-        # Any pair below threshold → collision in that env
-        return (dist < self.drone_drone_radius).any(dim=-1)   # (n,)
+    def _drone_ground_contact(self) -> torch.Tensor:
+        any_contact = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+        for i in range(NUM_DRONES):
+            sensor = self.env._contact_sensors[f"drone_{i}_contact"]
+            force_mat = sensor.data.force_matrix_w
+            if force_mat is None or force_mat.shape[2] < 2:
+                continue
+            ground_force = force_mat[:, 0, 1, :]                # body 0, filter 1 = ground
+            any_contact |= ground_force.norm(dim=-1) > 0.1
+        return any_contact
 
-    def _drone_crate_collision(self) -> torch.Tensor:
-        """
-        True if any drone centre is within drone_crate_radius of the
-        crate centre. Uses a simple sphere approximation around crate CoM
-        — good enough for termination, not for exact surface contact.
 
-        For a tighter AABB check, use _drone_crate_aabb() below instead.
-        """
-        pos       = self._all_drone_pos()                              # (n, A, 3)
-        crate_pos = self.env._crate.data.root_pos_w.unsqueeze(1)      # (n, 1, 3)
+    def _crate_ground_contact(self) -> torch.Tensor:
+        # filter index 0 = ground (only filter on crate sensor)
+        ground_force = self.env._crate_contact.data.net_forces_w[:, 0, :]   # (n, 3)
+        return ground_force.norm(dim=-1) > 0.5   # higher threshold — crate is heavy
 
-        dist = (pos - crate_pos).norm(dim=-1)   # (n, A)
-
-        return (dist < self.drone_crate_radius).any(dim=-1)            # (n,)
-
-    def _drone_crate_aabb(self) -> torch.Tensor:
-        """
-        Tighter alternative to sphere check: axis-aligned bounding box
-        using actual randomised crate_size + a small margin.
-        True if any drone centre is inside the inflated crate AABB.
-        """
-        pos       = self._all_drone_pos()                         # (n, A, 3)
-        crate_pos = self.env._crate.data.root_pos_w               # (n, 3)
-        half      = self.env._crate_size / 2                      # (n, 3)
-        margin    = 0.05                                           # 5 cm safety margin
-
-        # Expand crate centre and half-extents to match drone shape
-        crate_pos_e = crate_pos.unsqueeze(1)                      # (n, 1, 3)
-        half_e      = (half + margin).unsqueeze(1)                # (n, 1, 3)
-
-        # Check if drone is inside box on all 3 axes simultaneously
-        inside = ((pos - crate_pos_e).abs() < half_e).all(dim=-1)  # (n, A)
-
-        return inside.any(dim=-1)                                  # (n,)
-
-    def _drone_ground_collision(self) -> torch.Tensor:
-        """
-        True if any drone goes below min_drone_height or above max_drone_height.
-        Respects grace period after reset.
-        """
-        # Grace period: don't terminate during first ~2 seconds after reset
-        grace_period = self.env.episode_length_buf < self.env.cfg.reset_grace_steps
-        
-        pos = self._all_drone_pos()    # (n, A, 3)
-        z   = pos[:, :, 2]            # (n, A)
-
-        too_low  = (z < self.min_drone_height).any(dim=-1)   # (n,)
-        too_high = (z > self.max_drone_height).any(dim=-1)   # (n,)
-
-        # Only apply after grace period
-        return (too_low | too_high) & (~grace_period)   # (n,)
+    def _drone_too_high(self) -> torch.Tensor:
+        z = self._all_drone_pos()[:, :, 2]                         # (n, 4)
+        return (z > self.max_drone_height).any(dim=-1)             # (n,)
 
     def _crate_tip_over(self) -> torch.Tensor:
-        """
-        True if the crate has tipped beyond max_crate_tilt.
-
-        Method: extract the crate's local up-axis (rotated world Z)
-        from its quaternion, then measure the angle against world Z.
-
-        quat convention: (w, x, y, z)
-        Rotate world-up [0,0,1] by crate quaternion to get crate-up,
-        then cos(tilt) = dot(crate_up, world_up) = crate_up[:, 2]
-        """
-        q = self.env._crate.data.root_quat_w    # (n, 4)  [w, x, y, z]
+        q          = self.env._crate.data.root_quat_w              # (n, 4) [w,x,y,z]
         w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-
-        # Rotate world Z-axis [0,0,1] by quaternion:
-        # crate_up_z = 1 - 2*(x² + y²)   (z-component of rotated Z)
-        crate_up_z = 1.0 - 2.0 * (x * x + y * y)   # (n,)  = cos(tilt_angle)
-
-        # cos(tilt) < cos(max_tilt) → tilt > max_tilt
-        tilt_threshold = torch.cos(
-            torch.tensor(self.max_crate_tilt, device=self.device)
-        )
-
-        return crate_up_z < tilt_threshold   # (n,)
+        crate_up_z = 1.0 - 2.0 * (x * x + y * y)                 # cos(tilt)
+        threshold  = torch.cos(torch.tensor(self.max_crate_tilt, device=self.device))
+        return crate_up_z < threshold                              # (n,)
 
     def _timeout(self) -> torch.Tensor:
-        """True if episode has reached max steps."""
-        return self.env.episode_length_buf >= self.env.max_episode_length - 1  # (n,)
+        return self.env.episode_length_buf >= self.env.max_episode_length - 1
