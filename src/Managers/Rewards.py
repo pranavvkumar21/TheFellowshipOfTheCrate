@@ -6,32 +6,24 @@ from quadcopter_lift_env_cfg import NUM_DRONES
 # ---------------------------------------------------------------------------
 # Weights and scales — move to config later
 # ---------------------------------------------------------------------------
-
 # Task
-W_GOAL_HEIGHT        =  2.0    # exponential reward for crate Z
-W_GOAL_DIST          =  1.5    # tanh-shaped distance to goal
-W_GOAL_VEL_ALIGN     =  1.0    # reward velocity aimed at goal
+W_GOAL_HEIGHT    =  3.0    # increase — primary learning signal, needs to dominate
+W_GOAL_DIST      =  2.0    # increase slightly — complements height
+W_GOAL_VEL_ALIGN =  0.5    # keep low — useful but secondary
+W_GROUND_CONTACT = -1.5    # enough to break do-nothing without overwhelming everything
 
-# Crate stability (from paper)
-W_BALANCE            =  1.3    # balance: exp terms on crate angular vel + tilt
-W_TWIST              = -0.6    # twist: penalise crate yaw rate
+# Crate stability
+W_BALANCE        =  0.3    # low early — don't reward stillness over lifting
+W_TWIST          = -0.1    # very low — policy needs freedom to yaw-correct early on
 
 # Drone behaviour
-W_ALIVE              =  0.5    # per-step survival bonus
-W_SMOOTH_ACTION      =  -0.02   # small penalty for large action changes
-W_PROXIMITY          = -0.05   # small penalty for drones getting close
+W_ALIVE          =  0.0    # removed as discussed
+W_SMOOTH_ACTION  = -0.01   # halved — don't over-constrain exploration early
+W_PROXIMITY      = -0.05   # keep — drones crashing into each other is always bad
 
 # Terminal
-W_SUCCESS            = 10.0    # bonus on reaching goal
-W_CRASH              = -5.0    # penalty on termination
-
-# Scaling / shaping constants
-GOAL_HEIGHT_SIGMA    = 0.5     # exp(-z_err² / sigma) sharpness
-BALANCE_CX           = 1.0     # c_x in balance formula from paper
-PROXIMITY_SIGMA      = 0.3     # soft proximity falloff (metres)
-PROXIMITY_MIN_DIST   = 0.25    # start penalising below this distance (metres)
-SMOOTH_ACTION_SIGMA  = 0.1     # action delta scale for smoothness bonus
-
+W_SUCCESS        = 10.0    # keep — strong goal signal
+W_CRASH          = -3.0    # reduced — too harsh early discourages exploration
 
 # ---------------------------------------------------------------------------
 # Reward Manager
@@ -69,7 +61,7 @@ class RewardManager:
             k: torch.zeros(env.num_envs, device=self.device)
             for k in [
                 "goal_height", "goal_dist", "goal_vel_align",
-                "balance", "twist",
+                "balance", "twist", "ground_contact",
                 "alive", "smooth_action", "proximity",
                 "success", "crash",
             ]
@@ -79,7 +71,7 @@ class RewardManager:
         print(f"  W_GOAL_HEIGHT={W_GOAL_HEIGHT}  W_GOAL_DIST={W_GOAL_DIST}  "
               f"W_GOAL_VEL_ALIGN={W_GOAL_VEL_ALIGN}")
         print(f"  W_BALANCE={W_BALANCE}  W_TWIST={W_TWIST}")
-        print(f"  W_ALIVE={W_ALIVE}  W_SMOOTH={W_SMOOTH_ACTION}  W_PROXIMITY={W_PROXIMITY}")
+        print(f"  W_ALIVE={W_ALIVE}  W_SMOOTH={W_SMOOTH_ACTION}  W_PROXIMITY={W_PROXIMITY}  W_GROUND_CONTACT={W_GROUND_CONTACT}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -119,20 +111,21 @@ class RewardManager:
         raw_components = {
             "goal_height"    : W_GOAL_HEIGHT     * self._rew_goal_height(),
             "goal_dist"      : W_GOAL_DIST       * self._rew_goal_dist(),
-            "goal_vel_align" : W_GOAL_VEL_ALIGN  * self._rew_goal_vel_align(),
+            # "goal_vel_align" : W_GOAL_VEL_ALIGN  * self._rew_goal_vel_align(),
+            "ground_contact" : W_GROUND_CONTACT  * self._rew_ground_contact(),
             "balance"        : W_BALANCE         * self._rew_balance(),
-            "twist"          : W_TWIST           * self._rew_twist(),
+            # "twist"          : W_TWIST           * self._rew_twist(),
             # "alive"          : W_ALIVE           * self._rew_alive(),
-            "smooth_action"  : W_SMOOTH_ACTION   * self._rew_smooth_action(),
-            "proximity"      : W_PROXIMITY       * self._rew_proximity(),
+            # "smooth_action"  : W_SMOOTH_ACTION   * self._rew_smooth_action(),
+            # "proximity"      : W_PROXIMITY       * self._rew_proximity(),
             
             # Terminal rewards (always unscaled)
-            "success"        : W_SUCCESS         * terminated.float() *
-                               (self.env._crate.data.root_pos_w[:, 2] >=
-                                self.env.cfg.goal_pos[2] - 0.1).float(),
-            "crash"          : W_CRASH           * terminated.float() *
-                               (self.env._crate.data.root_pos_w[:, 2] <
-                                self.env.cfg.goal_pos[2] - 0.1).float(),
+            # "success"        : W_SUCCESS         * terminated.float() *
+            #                    (self.env._crate.data.root_pos_w[:, 2] >=
+            #                     self.env.cfg.goal_pos[2] - 0.1).float(),
+            # "crash"          : W_CRASH           * terminated.float() *
+            #                    (self.env._crate.data.root_pos_w[:, 2] <
+            #                     self.env.cfg.goal_pos[2] - 0.1).float(),
         }
 
         # 2. Accumulate the raw values for TensorBoard logging
@@ -141,7 +134,7 @@ class RewardManager:
 
         # 3. Apply dt scaling ONLY for the RL algorithm's training signal
         continuous_keys = [
-            "goal_height", "goal_dist", "goal_vel_align", 
+            "goal_height", "goal_dist", "goal_vel_align", "ground_contact", 
             "balance", "twist", "smooth_action", "proximity"
             # add "alive" here if you uncomment it
         ]
@@ -171,12 +164,10 @@ class RewardManager:
         return torch.exp(-2.0 * height_error)
     
     def _rew_goal_dist(self):
-        goal_pos  = self.env._goal_pos_w          # (n, 3) world frame, per-env
-        crate_pos = self.env._crate.data.root_pos_w[:, :3]  # (n, 3) world frame
-        dist_sq_curr    = torch.sum((goal_pos - crate_pos) ** 2, dim=-1)
-        # Use a fixed normalisation constant instead of initial dist (avoids div-by-zero edge cases)
-        reward = torch.exp(-3.0 * dist_sq_curr)
-        return reward
+        goal_pos  = self.env._goal_pos_w
+        crate_pos = self.env._crate.data.root_pos_w[:, :3]
+        dist = torch.norm(goal_pos - crate_pos, dim=-1)      # (n,)  NOT squared
+        return torch.exp(-1.0 * dist)       
     def _rew_goal_vel_align(self) -> torch.Tensor:
         """
         Reward crate velocity that is aligned toward the goal.
@@ -193,28 +184,15 @@ class RewardManager:
         return alignment.clamp(min=0.0)   # only reward progress, not regression
 
     def _rew_balance(self) -> torch.Tensor:
-        """
-        From paper:
-            1.3 * (exp(-2.5*cx * |v_z|²) + exp(-2*cx * ||ω_xy||²))
-
-        v_z   = crate vertical velocity
-        ω_xy  = crate roll + pitch angular velocity (not yaw)
-
-        Both terms peak at 1.0 when the crate is perfectly stable.
-        Note: W_BALANCE is applied externally in compute(), so we return
-        the raw sum here (max value = 2.0).
-        """
-        cx = BALANCE_CX
-
-        # Crate vertical velocity
-        v_z   = self.env._crate.data.root_lin_vel_w[:, 2]          # (n,)
 
         # Crate angular velocity — roll (x) and pitch (y) only, not yaw
         omega  = self.env._crate.data.root_ang_vel_w                # (n, 3)
-        omega_xy_sq = (omega[:, 0] ** 2 + omega[:, 1] ** 2)        # (n,)  ||ω_xy||²
+        # omega_xy_sq = (omega[:, 0] ** 2 + omega[:, 1] ** 2)        # (n,)  ||ω_xy||²
+
+        omega_z_sq = omega[:, 2] ** 2                                   # (n,)  ω_z²
 
         # term1 = torch.exp(-2.5 * cx * (v_z ** 2))                  # (n,)
-        term2 = torch.exp(-2.0 * cx * omega_xy_sq)                 # (n,)
+        term2 = torch.exp(-2.0 * omega_z_sq)                 # (n,)
 
         return  term2                                        # (n,)  ∈ (0, 2]
 
@@ -281,3 +259,8 @@ class RewardManager:
         penalty = torch.exp(-dist / PROXIMITY_SIGMA) * active      # (n, 6)
 
         return penalty.sum(dim=-1)                                  # (n,)
+
+    def _rew_ground_contact(self) -> torch.Tensor:
+        ground_force = self.env._crate_contact.data.net_forces_w[:, 0, :]  # (n, 3)
+        in_contact   = ground_force.norm(dim=-1) > 0.5                      # (n,) bool
+        return in_contact.float()   # 1.0 when crate touching ground, 0.0 when lifted
