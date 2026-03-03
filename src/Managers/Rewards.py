@@ -13,7 +13,7 @@ W_GOAL_VEL_ALIGN =  0.5    # keep low — useful but secondary
 W_GROUND_CONTACT = -1.5    # enough to break do-nothing without overwhelming everything
 
 # Crate stability
-W_BALANCE        =  0.3    # low early — don't reward stillness over lifting
+W_BALANCE        =  0.5    # low early — don't reward stillness over lifting
 W_TWIST          = -0.1    # very low — policy needs freedom to yaw-correct early on
 
 # Drone behaviour
@@ -189,12 +189,13 @@ class RewardManager:
         omega  = self.env._crate.data.root_ang_vel_w                # (n, 3)
         # omega_xy_sq = (omega[:, 0] ** 2 + omega[:, 1] ** 2)        # (n,)  ||ω_xy||²
 
-        omega_z_sq = omega[:, 2] ** 2                                   # (n,)  ω_z²
+        omega_z_sq = omega[:, 2] ** 2      
+        omega_xy_sq = (omega[:, 0] ** 2 + omega[:, 1] ** 2)        # (n,)  ||ω_xy||²
 
-        # term1 = torch.exp(-2.5 * cx * (v_z ** 2))                  # (n,)
+        term1 = torch.exp(-2.5 * omega_xy_sq)                  # (n,)
         term2 = torch.exp(-2.0 * omega_z_sq)                 # (n,)
 
-        return  term2                                        # (n,)  ∈ (0, 2]
+        return  term1 + term2                                        # (n,)  ∈ (0, 2]
 
     def _rew_twist(self) -> torch.Tensor:
         """

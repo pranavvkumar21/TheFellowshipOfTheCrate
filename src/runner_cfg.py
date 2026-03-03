@@ -57,11 +57,11 @@ def create_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         # mini_batch_size = total_steps / num_mini_batches
         num_mini_batches=16,
         # Discount factor — 0.99 rewards long-horizon cooperative behaviour
-        gamma=0.99,
+        gamma=0.992,
         # GAE lambda
         lam=0.95,
         # Entropy coefficient — slightly elevated for sparse-ish lift task
-        entropy_coef=0.001,
+        entropy_coef=0.0025,
         # KL divergence target for adaptive lr
         desired_kl=0.01,
         # PPO clip range
