@@ -79,7 +79,7 @@ def create_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     # ------------------------------------------------------------------
     policy_cfg = RslRlPpoActorCriticCfg(
         # Initial action noise std — moderate; log-parameterised std adapts
-        init_noise_std=0.7,
+        init_noise_std=1.0,
         noise_std_type="log",
         # Running mean/std normalisation for both actor and critic inputs
         actor_obs_normalization=True,

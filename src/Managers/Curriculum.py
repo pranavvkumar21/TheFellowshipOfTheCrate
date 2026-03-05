@@ -1,39 +1,57 @@
 # curriculum_manager.py
 import torch
 
+
 class CurriculumManager:
     """
-    Time-based linear curriculum for CoopLiftEnv.
-    Each parameter grows from 0.0 to 1.0 over a specified number of steps.
+    Staggered curriculum — rewards activate in order of learning priority:
+
+      Phase 1 (0 → 64k):   proximity only — drones learn not to collide
+      Phase 2 (32k → 160k): goal_dist ramps — learn to move crate toward goal
+      Phase 3 (128k → 256k): formation_deviation ramps — refine coordination
+
+    Overlap between phases is intentional: smooth gradient transitions.
+    
+    goal_dist_potential is NOT curriculum-gated here — instead, reduce its
+    weight significantly in reward_manager.py (see note below).
     """
+
     def __init__(self, env):
         self.env = env
-        
-        # Current progress (0.0 to 1.0) for each category
-        self.factors = {
-            "mass":   0.0,
-            "goal":   0.0,
-            "reward": 0.0
+        self.total_steps: int = 0
+
+        self.factors: dict[str, float] = {
+            "proximity":             0.0,
+            "goal_dist":             0.0,
+            "formation_deviation":   0.0,
         }
-        
-        # Total control steps to reach 1.0 (1,000,000 = ~4.6 hours at 60Hz)
-        self.steps_to_full = {
-            "mass":   2_000_000,  # Slowest: take time to introduce heavy weights
-            "goal":   1_000_000,  # Medium: push height/offset after basic lift is learned
-            "reward": 500_000,    # Fastest: enable penalties/smoothness early
+
+        # Staggered ramp schedule: (start_step, end_step)
+        self._schedule: dict[str, tuple[int, int]] = {
+            "proximity":           (0,       64_000),   # Phase 1
+            "goal_dist":           (32_000,  160_000),  # Phase 2 — starts mid Phase 1
+            "formation_deviation": (128_000, 256_000),  # Phase 3 — only after lifting learned
         }
-        
-        # Internal step counter
-        self.total_steps = 0
+
+        print("[CurriculumManager] staggered curriculum:")
+        for k, (s, e) in self._schedule.items():
+            print(f"  {k}: ramps {s} → {e} steps")
 
     def update(self):
-        """Called once per env step to progress all factors."""
+        """Call once per env step (not per physics sub-step)."""
         self.total_steps += 1
-        
-        for key in self.factors:
-            # Linear growth: progress = current_steps / max_steps
-            progress = self.total_steps / self.steps_to_full[key]
-            self.factors[key] = min(1.0, progress)
+        for key, (start, end) in self._schedule.items():
+            if self.total_steps < start:
+                self.factors[key] = 0.0
+            elif self.total_steps >= end:
+                self.factors[key] = 1.0
+            else:
+                self.factors[key] = (self.total_steps - start) / (end - start)
 
     def get_factor(self, key: str) -> float:
-        return self.factors.get(key, 0.0)
+        return self.factors.get(key, 1.0)
+
+    def get_log_dict(self) -> dict[str, float]:
+        return {
+            f"curriculum/{k}": v for k, v in self.factors.items()
+        } | {"curriculum/step": float(self.total_steps)}

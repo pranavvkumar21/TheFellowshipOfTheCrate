@@ -13,7 +13,7 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.sensors import ContactSensor
 
 
-from Managers import ObservationManager, ActionManager, TerminationManager, RewardManager, CommandManager
+from Managers import ObservationManager, ActionManager, TerminationManager, RewardManager, CommandManager, CurriculumManager
 from quadcopter_lift_env_cfg import (
     CoopLiftEnvCfg, NUM_DRONES,
     
@@ -122,11 +122,23 @@ class CoopLiftEnv(DirectMARLEnv):
             for i in range(NUM_DRONES)
         }
 
-
+        #initializing dones coz  get dones is called first
+        self._term = {
+            name: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            for name in self.cfg.possible_agents
+        }
+        self._timeout = {
+            name: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            for name in self.cfg.possible_agents
+        }
         self._obs_manager = ObservationManager(self)
         self._action_manager = ActionManager(self)
         self._termination_manager = TerminationManager(self)
         self._reward_manager = RewardManager(self)
+
+        # Curriculum — must be created AFTER RewardManager so we can link it
+        self._curriculum_manager = CurriculumManager(self)
+        self._reward_manager.curriculum = self._curriculum_manager
 
         # Goal set it to zero for now
         self._goal_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
@@ -182,18 +194,8 @@ class CoopLiftEnv(DirectMARLEnv):
         self._joints_created = False
 
     # -----------------------------------------------------------------------
-    def _update_curriculum(self):
-        """Slowly ramp curriculum based on mean goal_dist reward across envs."""
-        mean_perf = torch.exp(-1.0 * (
-            self._goal_pos_w[:, 2] - self._crate.data.root_pos_w[:, 2]
-        ).clamp(min=0.0)).mean().item()   # 0→1, 1 = crate at goal
-
-        # Exponential moving average — tau controls how fast it responds
-        tau = 0.001   # ~1000 steps to fully shift
-        if mean_perf > 0.5:      # only advance when doing reasonably well
-            self.curriculum = min(1.0, self.curriculum + tau)
-        else:
-            self.curriculum = max(0.0, self.curriculum - tau * 0.5)  # decay slower
+    # _update_curriculum removed — replaced by CurriculumManager (time-based)
+    # -----------------------------------------------------------------------
 
     def _print_prim_tree(self, root_path: str, max_depth: int = 4):
         """Debug helper — call once to see actual prim tree after cloning."""
@@ -348,12 +350,20 @@ class CoopLiftEnv(DirectMARLEnv):
 
     # -----------------------------------------------------------------------
     def _get_rewards(self):
-        term, timeout = self._termination_manager.compute()
-        return self._reward_manager.compute(term["drone_0"], timeout["drone_0"])
+        # Update curriculum once per env step (not per physics sub-step)
+        self._curriculum_manager.update()
+
+        # _get_dones() is called BEFORE _get_rewards() by DirectMARLEnv.step(),
+        # so self._term / self._timeout are already fresh for this step.
+        return self._reward_manager.compute(self._term["drone_0"], self._timeout["drone_0"])
     # -----------------------------------------------------------------------
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        # Termination manager already checks all conditions including height
-        return self._termination_manager.compute() 
+        # Must compute terminations HERE — DirectMARLEnv.step() calls
+        # _get_dones() first, then _get_rewards().  Computing in _get_rewards()
+        # caused a one-step delay: crashed envs got an extra physics step
+        # producing NaN/Inf → corrupted policy parameters.
+        self._term, self._timeout = self._termination_manager.compute()
+        return self._term, self._timeout
 
     # -----------------------------------------------------------------------
     def _find_prim_by_type(self, root_prim, type_name: str):
@@ -380,7 +390,9 @@ class CoopLiftEnv(DirectMARLEnv):
         if "episode" not in self.extras:
             self.extras["episode"] = {}
         self.extras["episode"].update(reward_logs)
-        # TODO: add curriculum stage to extras for logging
+        # Curriculum logging
+        self.extras["episode"].update(self._curriculum_manager.get_log_dict())
+        # Termination logging
         self.extras["episode"].update(term_logs)
         # self.extras.setdefault("curriculum", ).append(self.curriculum)
         # Create joints ONCE on first reset (after super() initializes physics bodies)
@@ -479,6 +491,11 @@ class CoopLiftEnv(DirectMARLEnv):
             #     drone_attach_z = state[idx, 2] - 0.02
             #     rope_dist = drone_attach_z - crate_attach_z
             #     print(f"  Rope attachment distance: {rope_dist:.3f}m (should be {self.cfg.rope_length}m)\n")
+
+        # reset dist buffer in reward manager for potential-based shaping
+        #this is done after resetting the drone and crate positions, 
+        #so that the initial distance is correct for the new episode
+        self._reward_manager.reset_dist(env_ids)
 
         # ------------------------------------------------------------------
         # Clear buffers

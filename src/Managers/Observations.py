@@ -1,6 +1,47 @@
 from __future__ import annotations
+import json
 import torch
+from datetime import datetime, timezone
+from pathlib import Path
 from quadcopter_lift_env_cfg import NUM_DRONES
+
+# ---- NaN debug: log only the very first occurrence per run ----
+# If Rewards.py already fired, this flag stops a duplicate log entry.
+_nan_logged: bool = False
+_NAN_LOG_PATH = Path(__file__).resolve().parent.parent.parent / "logs" / "nan_debug.jsonl"
+
+
+def _log_nan_event(source: str, tensor_name: str, tensor: torch.Tensor, step: int) -> None:
+    """Append a single JSON record to nan_debug.jsonl and print to stdout."""
+    global _nan_logged
+    if _nan_logged:
+        return
+    _nan_logged = True
+
+    has_nan = bool(torch.isnan(tensor).any())
+    has_inf = bool(torch.isinf(tensor).any())
+    n_affected = int((torch.isnan(tensor) | torch.isinf(tensor)).any(dim=-1).sum())
+
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "tensor": tensor_name,
+        "has_nan": has_nan,
+        "has_inf": has_inf,
+        "n_envs_affected": n_affected,
+        "step": step,
+        "tensor_shape": list(tensor.shape),
+    }
+
+    _NAN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _NAN_LOG_PATH.open("a") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+    print(
+        f"[NaN DEBUG] first occurrence | source={source} tensor={tensor_name} "
+        f"nan={has_nan} inf={has_inf} envs_affected={n_affected} step={step} "
+        f"→ {_NAN_LOG_PATH}"
+    )
 
 
 _CORNER_SIGNS = torch.tensor([
@@ -39,6 +80,7 @@ class ObservationManager:
         ("neighbour_linvel",       (NUM_DRONES-1)*3),
         ("neighbour_quat",         (NUM_DRONES-1)*4),
         ("neighbour_action_state", (NUM_DRONES-1)*4),
+        ("rope_stretch",           1),
     ]
 
     def __init__(self, env):
@@ -72,24 +114,6 @@ class ObservationManager:
         Returns per-agent obs dict: {"drone_i": (num_envs, obs_dim)}
         Internally computes (num_envs, NUM_DRONES, obs_dim) then splits.
         """
-        for name, tensor in [
-            ("drone_quat",             self._drone_quat()),
-            ("drone_linvel",           self._drone_linvel()),
-            ("crate_rel_pos",          self._crate_rel_pos()),
-            ("crate_height",           self._crate_height()),
-            ("crate_abs_vel",          self._crate_abs_vel()),
-            ("crate_quat",             self._crate_quat()),
-            ("goal_rel_pos",           self._goal_rel_pos()),
-            ("goal_abs_vel_error",     self._goal_abs_vel_error()),
-            ("action_state",           self._action_state()),
-            ("neighbour_rel_pos",      self._neighbour_rel_pos()),
-            ("neighbour_linvel",       self._neighbour_linvel()),
-            ("neighbour_quat",         self._neighbour_quat()),
-            ("neighbour_action_state", self._neighbour_action_state()),
-        ]:
-            if not tensor.isfinite().all():
-                print(f"BAD TERM: {name} — min={tensor.min():.3f} max={tensor.max():.3f}")
-
         full_obs = torch.cat([
             self._drone_quat(),              # 4
             self._drone_linvel(),            # 3
@@ -104,7 +128,26 @@ class ObservationManager:
             self._neighbour_linvel(),        # 9
             self._neighbour_quat(),          # 12
             self._neighbour_action_state(),  # 12
+            self._rope_stretch(),            # 1
         ], dim=-1)  # (n, A, obs_dim)
+
+        # ---- NaN/Inf detection — log first occurrence ----
+        if not _nan_logged:
+            step = int(self.env.episode_length_buf.max().item())
+            for _tname, _t in [
+                ("crate_pos",    self.env._crate.data.root_pos_w),
+                ("drone_0_pos",  self.env._drones["drone_0"].data.root_pos_w),
+                ("crate_ang_vel",self.env._crate.data.root_ang_vel_w),
+            ]:
+                if torch.isnan(_t).any() or torch.isinf(_t).any():
+                    _log_nan_event("observations", _tname, _t, step)
+                    break
+
+        # Guard against NaN/Inf from physics instability — prevents
+        # corrupting the policy network (which causes the
+        # "normal expects all elements of std >= 0.0" crash).
+        full_obs = torch.nan_to_num(full_obs, nan=0.0, posinf=0.0, neginf=0.0)
+        full_obs = full_obs.clamp(-100.0, 100.0)
 
         return {
             f"drone_{i}": full_obs[:, i, :]
@@ -253,3 +296,41 @@ class ObservationManager:
     def _crate_height(self) -> torch.Tensor:
         z = self.env._crate.data.root_pos_w[:, 2:3]  # (n, 1)
         return self._broadcast_crate(z)               # (n, A, 1)
+    def _rope_stretch(self) -> torch.Tensor:
+        """
+        Per-drone rope stretch: how much each rope is taut.
+        = clamp(dist(drone_attach, crate_corner_attach) - rope_length, 0, inf)
+        Positive = rope is taut and under tension.
+        Zero = rope is slack.
+        (n, A, 1)
+        """
+        crate_pos  = self.env._crate.data.root_pos_w          # (n, 3)
+        half       = self.env._crate_size / 2                 # (n, 3)
+
+        corner_signs = torch.tensor([
+            [ 1.,  1.],
+            [-1.,  1.],
+            [-1., -1.],
+            [ 1., -1.],
+        ], device=self.device)  # (A, 2)
+
+        # Crate corner attachment points in world frame
+        # corner xy = crate_pos_xy + sign * half_xy
+        # corner z  = crate_pos_z  + half_z  (top face)
+        corners_xy = (
+            crate_pos[:, :2].unsqueeze(1) +                   # (n, 1, 2)
+            corner_signs.unsqueeze(0) * half[:, :2].unsqueeze(1)  # (n, A, 2)
+        )  # (n, A, 2)
+        corners_z = (crate_pos[:, 2] + half[:, 2]).reshape(-1, 1, 1).expand(-1, NUM_DRONES, 1)  # (n, A, 1)
+        crate_attach = torch.cat([corners_xy, corners_z], dim=-1)  # (n, A, 3)
+
+        # Drone attachment point: 2cm below drone centre
+        drone_pos    = self._all_drone_pos()                   # (n, A, 3)
+        drone_attach = drone_pos.clone()
+        drone_attach[:, :, 2] -= 0.02                         # (n, A, 3)
+
+        dist         = (drone_attach - crate_attach).norm(dim=-1, keepdim=True)  # (n, A, 1)
+        stretch      = (dist - self.env.cfg.rope_length).clamp(min=0.0)          # (n, A, 1)
+
+        return stretch  # (n, A, 1)
+

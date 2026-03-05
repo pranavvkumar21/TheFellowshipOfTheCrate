@@ -22,7 +22,6 @@ class TerminationManager:
                 "inter_drone_collision",
                 "drone_crate_contact",
                 "drone_ground_contact",
-                "crate_ground_contact",
                 "crate_tip_over",
                 "drone_too_high",
                 "timeout",
@@ -42,7 +41,7 @@ class TerminationManager:
     def reset(self, env_ids: torch.Tensor) -> dict[str, float]:
         logged_stats = {}
         for cause, count_tensor in self._episode_term_counts.items():
-            logged_stats[f"term_{cause}"] = torch.mean(count_tensor[env_ids]).item()
+            logged_stats[f"termination/{cause}"] = torch.mean(count_tensor[env_ids]).item()
             count_tensor[env_ids] = 0.0
         self._prev_terminated[env_ids] = False
         return logged_stats
@@ -53,18 +52,18 @@ class TerminationManager:
         inter_drone    = self._inter_drone_collision()
         drone_crate    = self._drone_crate_contact()
         drone_ground   = self._drone_ground_contact() #& ~grace
-        crate_ground   = self._crate_ground_contact() #& ~grace
         drone_too_high = self._drone_too_high()
         crate_tip      = self._crate_tip_over()
+        nan_state      = self._nan_detected()
         timeout        = self._timeout()
 
-        terminated = inter_drone | drone_crate | drone_ground | drone_too_high | crate_tip
+        terminated = inter_drone | drone_crate | drone_ground | drone_too_high | crate_tip | nan_state
         timed_out  = timeout & ~terminated
 
         newly_terminated = terminated & ~self._prev_terminated
         self._log_new_terminations(
-            newly_terminated, inter_drone, drone_crate,
-            drone_ground, crate_ground, drone_too_high, crate_tip
+            newly_terminated, timed_out, inter_drone, drone_crate,
+            drone_ground, drone_too_high, crate_tip
         )
         self._prev_terminated = terminated.clone()
 
@@ -79,7 +78,6 @@ class TerminationManager:
             "inter_drone_collision" : self._inter_drone_collision(),
             "drone_crate_contact"   : self._drone_crate_contact(),
             # "drone_ground_contact"  : self._drone_ground_contact() & ~grace,
-            "crate_ground_contact"  : self._crate_ground_contact() & ~grace,
             "drone_too_high"        : self._drone_too_high(),
             "crate_tip_over"        : self._crate_tip_over(),
             "timeout"               : self._timeout(),
@@ -92,13 +90,14 @@ class TerminationManager:
     def _log_new_terminations(
         self,
         newly_terminated: torch.Tensor,
+        timed_out:      torch.Tensor,
         inter_drone:    torch.Tensor,
         drone_crate:    torch.Tensor,
         drone_ground:   torch.Tensor,
-        crate_ground:   torch.Tensor,
         drone_too_high: torch.Tensor,
         crate_tip:      torch.Tensor,
     ) -> None:
+        # Log crash terminations
         term_ids = newly_terminated.nonzero(as_tuple=True)[0]
         for env_id in term_ids:
             if inter_drone[env_id]:
@@ -107,12 +106,14 @@ class TerminationManager:
                 self._episode_term_counts["drone_crate_contact"][env_id] += 1
             elif drone_ground[env_id]:
                 self._episode_term_counts["drone_ground_contact"][env_id] += 1
-            elif crate_ground[env_id]:
-                self._episode_term_counts["crate_ground_contact"][env_id] += 1
             elif drone_too_high[env_id]:
                 self._episode_term_counts["drone_too_high"][env_id] += 1
             elif crate_tip[env_id]:
                 self._episode_term_counts["crate_tip_over"][env_id] += 1
+
+        # Log timeouts (mutually exclusive with crash terminations)
+        timeout_ids = timed_out.nonzero(as_tuple=True)[0]
+        self._episode_term_counts["timeout"][timeout_ids] += 1
 
     # ------------------------------------------------------------------
     # Conditions
@@ -156,11 +157,6 @@ class TerminationManager:
         return any_contact
 
 
-    def _crate_ground_contact(self) -> torch.Tensor:
-        # filter index 0 = ground (only filter on crate sensor)
-        ground_force = self.env._crate_contact.data.net_forces_w[:, 0, :]   # (n, 3)
-        return ground_force.norm(dim=-1) > 0.5   # higher threshold — crate is heavy
-
     def _drone_too_high(self) -> torch.Tensor:
         z = self._all_drone_pos()[:, :, 2]                         # (n, 4)
         return (z > self.max_drone_height).any(dim=-1)             # (n,)
@@ -171,6 +167,14 @@ class TerminationManager:
         crate_up_z = 1.0 - 2.0 * (x * x + y * y)                 # cos(tilt)
         threshold  = torch.cos(torch.tensor(self.max_crate_tilt, device=self.device))
         return crate_up_z < threshold                              # (n,)
+
+    def _nan_detected(self) -> torch.Tensor:
+        """Terminate envs where any drone or crate position is NaN/Inf (physics explosion)."""
+        pos = self._all_drone_pos()                                 # (n, 4, 3)
+        crate_pos = self.env._crate.data.root_pos_w                # (n, 3)
+        nan_drone = ~pos.isfinite().all(dim=-1).all(dim=-1)        # (n,)
+        nan_crate = ~crate_pos.isfinite().all(dim=-1)              # (n,)
+        return nan_drone | nan_crate
 
     def _timeout(self) -> torch.Tensor:
         return self.env.episode_length_buf >= self.env.max_episode_length - 1

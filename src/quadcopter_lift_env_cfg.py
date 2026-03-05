@@ -13,7 +13,7 @@ from isaaclab.sensors import ContactSensorCfg
 
 NUM_DRONES: int = 4
 _ACTION_DIM: int = 4   # [thrust, mx, my, mz]
-_OBS_DIM: int = 70     # placeholder
+_OBS_DIM: int = 71     # placeholder
 CRATE_SIZE: tuple = (0.4, 0.4, 0.2)   # (x, y, z) in metres
 
 def _make_drone_cfg(pos: tuple, id: int) -> ArticulationCfg:
